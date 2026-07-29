@@ -2280,6 +2280,9 @@ dependencies = [
  "jfn-linux-util",
  "jfn-platform-abi",
  "nix",
+ "objc2",
+ "objc2-io-surface",
+ "objc2-metal",
  "parking_lot",
  "pollster",
  "raw-window-handle",
@@ -2287,6 +2290,7 @@ dependencies = [
  "tracing",
  "wgpu",
  "wgpu-hal",
+ "windows",
 ]
 
 [[package]]
@@ -3116,6 +3120,7 @@ dependencies = [
  "block2",
  "objc2",
  "objc2-foundation",
+ "objc2-io-surface",
 ]
 
 [[package]]
