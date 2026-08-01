@@ -2247,6 +2247,8 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "slotmap",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2448,6 +2450,7 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "tracing",
+ "url",
  "uuid",
 ]
 

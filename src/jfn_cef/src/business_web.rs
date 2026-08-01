@@ -99,6 +99,24 @@ pub unsafe fn jfn_web_exec_js(js_utf8: *const c_char) {
     inner.exec_js(&js);
 }
 
+/// Ask the embedded Jellyfin Web playback manager to play an item.
+///
+/// Calls made before Jellyfin's input plugin is ready are held by the page and
+/// consumed when the plugin is constructed.
+#[cfg(feature = "external-frontend")]
+pub fn jfn_web_play_item(item_id: &str) {
+    let inner = match INSTANCE.lock().as_ref() {
+        Some(state) => Arc::clone(&state.layer),
+        None => return,
+    };
+    let Ok(item_id) = serde_json::to_string(item_id) else {
+        return;
+    };
+    inner.exec_js(&format!(
+        "if(window._jelliumPlayItem)window._jelliumPlayItem({item_id});else window._jelliumPendingPlayItem={item_id};"
+    ));
+}
+
 fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {
     let l = unsafe { &*layer };
 
@@ -217,6 +235,8 @@ fn handle_player_load(args: &ListValue) {
     } else {
         false
     };
+    #[cfg(feature = "external-frontend")]
+    crate::business_external::jfn_external_show_player();
     jfn_logging::log(
         jfn_logging::CATEGORY_CEF,
         jfn_logging::LEVEL_INFO,
@@ -401,8 +421,18 @@ fn handle_message(message: BrowserMessage) -> bool {
             });
         }),
         "notifyPlaybackState" => {
-            // mpv is the authoritative source via coordinator; ignore JS hint.
-            true
+            // mpv remains authoritative for playback state. The JS hint is
+            // used only to switch the optional external frontend surface.
+            #[cfg(feature = "external-frontend")]
+            {
+                with_args(args, |a| {
+                    crate::business_external::jfn_external_on_playback_state(&list_string(a, 0));
+                })
+            }
+            #[cfg(not(feature = "external-frontend"))]
+            {
+                true
+            }
         }
         "notifySeek" => with_args(args, |a| {
             pb_post(PbInput::Seeked(list_int(a, 0) as i64 * 1000));

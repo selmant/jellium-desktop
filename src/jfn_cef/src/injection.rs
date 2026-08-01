@@ -64,6 +64,8 @@ pub(crate) enum NativeFunction {
     CsdReady,
     MenuItemSelected,
     MenuDismissed,
+    #[cfg(feature = "external-frontend")]
+    PlayJellyfinItem,
 }
 
 impl NativeFunction {
@@ -114,6 +116,8 @@ impl NativeFunction {
             "csdReady" => Self::CsdReady,
             "menuItemSelected" => Self::MenuItemSelected,
             "menuDismissed" => Self::MenuDismissed,
+            #[cfg(feature = "external-frontend")]
+            "playJellyfinItem" => Self::PlayJellyfinItem,
             _ => return None,
         })
     }
@@ -165,6 +169,8 @@ impl NativeFunction {
             Self::CsdReady => "csdReady",
             Self::MenuItemSelected => "menuItemSelected",
             Self::MenuDismissed => "menuDismissed",
+            #[cfg(feature = "external-frontend")]
+            Self::PlayJellyfinItem => "playJellyfinItem",
         }
     }
 }
@@ -180,6 +186,8 @@ pub(crate) enum InjectedScript {
     Csd,
     ContextMenu,
     SelectMenu,
+    #[cfg(feature = "external-frontend")]
+    ExternalHost,
 }
 
 impl InjectedScript {
@@ -194,6 +202,8 @@ impl InjectedScript {
             "csd.js" => Self::Csd,
             "context-menu.js" => Self::ContextMenu,
             "select-menu.js" => Self::SelectMenu,
+            #[cfg(feature = "external-frontend")]
+            "external-host.js" => Self::ExternalHost,
             _ => return None,
         })
     }
@@ -209,6 +219,8 @@ impl InjectedScript {
             Self::Csd => "csd.js",
             Self::ContextMenu => "context-menu.js",
             Self::SelectMenu => "select-menu.js",
+            #[cfg(feature = "external-frontend")]
+            Self::ExternalHost => "external-host.js",
         }
     }
 
@@ -277,6 +289,11 @@ const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
 
 const ABOUT_FUNCTIONS: &[NativeFunction] =
     &[NativeFunction::AboutOpenPath, NativeFunction::AboutDismiss];
+
+#[cfg(feature = "external-frontend")]
+const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[NativeFunction::PlayJellyfinItem];
+#[cfg(feature = "external-frontend")]
+const EXTERNAL_SCRIPTS: &[InjectedScript] = &[InjectedScript::ExternalHost];
 
 const WINDOW_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::WindowMinimize,
@@ -564,6 +581,15 @@ pub(crate) fn build_for_kind(
             &[],
             add_ctx_menu,
             true,
+            shared_textures_enabled,
+            ctx_menu,
+        )),
+        #[cfg(feature = "external-frontend")]
+        "external" => Some(build_extra_info(
+            EXTERNAL_FUNCTIONS,
+            EXTERNAL_SCRIPTS,
+            false,
+            false,
             shared_textures_enabled,
             ctx_menu,
         )),

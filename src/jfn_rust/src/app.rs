@@ -491,7 +491,10 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
 fn init_main_browser(
     hz: f64,
     use_shared_textures: bool,
+    host_options: &crate::host::HostOptions,
 ) -> (std::thread::JoinHandle<()>, *mut jfn_cef::JfnCefLayer) {
+    #[cfg(not(feature = "external-frontend"))]
+    let _ = host_options;
     // Must run before main browser create: the pre-loaded page fires its
     // initial theme-color IPC at DOMContentLoaded.
     let titlebar_themed = jfn_config::titlebar_theme_color();
@@ -530,10 +533,26 @@ fn init_main_browser(
     jfn_cef::business_overlay::jfn_overlay_init(main_layer);
     tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
 
+    #[cfg(feature = "external-frontend")]
+    if let Some(frontend) = host_options.external_frontend() {
+        jfn_cef::business_external::jfn_external_init(
+            main_layer,
+            frontend.start_url(),
+            frontend.allowed_origin(),
+        );
+    }
+
     (manager_thread, main_layer)
 }
 
 pub fn jfn_app_main() -> c_int {
+    jfn_app_main_with(crate::host::HostOptions::default())
+}
+
+/// Run the complete Jellium lifecycle with an optional external frontend.
+///
+/// This is the supported entry point for a thin downstream desktop binary.
+pub fn jfn_app_main_with(host_options: crate::host::HostOptions) -> c_int {
     crate::platform_install::install_early();
 
     let rc = jfn_cef::ffi::jfn_cef_start();
@@ -632,7 +651,7 @@ pub fn jfn_app_main() -> c_int {
         disable_gpu_compositing: opts.disable_gpu_compositing,
         remote_debugging_port: opts.remote_debugging_port,
     };
-    let rc = unsafe { run_with_cef(&boot_args) };
+    let rc = unsafe { run_with_cef(&boot_args, &host_options) };
     if rc != 0 {
         return rc;
     }
@@ -788,7 +807,7 @@ fn h_shutdown_wake_manager() {
 }
 
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
-unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
+unsafe fn run_with_cef(ba: &BootArgs, host_options: &crate::host::HostOptions) -> c_int {
     // 2. Platform init (PlatformScope). Cleanup happens in shutdown_runtime.
     let mpv_raw = jfn_mpv::boot::jfn_mpv_handle_get();
     let platform_ok = plat().init(mpv_raw as *mut std::ffi::c_void);
@@ -817,11 +836,13 @@ unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
 
     let hz = boot_mpv_reconcile(mpv_raw);
 
-    let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures);
+    let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures, host_options);
 
     if !start_playback_coordination() {
         return 1;
     }
+    #[cfg(feature = "external-frontend")]
+    jfn_cef::business_external::jfn_external_start_playback_observer();
 
     // 14. Wait for the main browser to finish loading. Skipped when the
     //     platform pumps CEF itself (external pump on the main thread):

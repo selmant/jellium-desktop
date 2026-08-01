@@ -6,6 +6,8 @@ pub mod bridge;
 pub mod browsers;
 pub mod business_about;
 mod business_common;
+#[cfg(feature = "external-frontend")]
+pub mod business_external;
 pub mod business_overlay;
 pub mod business_web;
 pub mod client;

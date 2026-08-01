@@ -2,6 +2,10 @@
 
 An unofficial [Jellyfin](https://jellyfin.org) desktop client built on [CEF](https://github.com/chromiumembedded/cef) and [mpv](https://mpv.io/).
 
+The experimental [external frontend host API](EXTERNAL_FRONTEND_SDK.md) lets a
+thin GPL-compatible desktop binary display an allowlisted web frontend and
+delegate item playback to Jellium's existing Jellyfin Web/mpv path.
+
 ## Downloads
 ### Linux
 - AppImage

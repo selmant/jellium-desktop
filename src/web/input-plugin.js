@@ -16,6 +16,27 @@
             if (playbackManager && window.Events) {
                 this.setupEvents(playbackManager);
             }
+
+            this.externalPlayItem = (itemId) => {
+                if (typeof itemId !== 'string' || !itemId || !this.playbackManager) return;
+                const serverId = window.ApiClient?.serverId?.();
+                if (!serverId) {
+                    console.error('[Media] external play request failed: Jellyfin server unavailable');
+                    if (window.jmpNative) window.jmpNative.notifyPlaybackState('Stopped');
+                    return;
+                }
+                Promise.resolve(this.playbackManager.play({ ids: [itemId], serverId }))
+                    .catch((error) => {
+                        console.error('[Media] external play request failed:', error);
+                        if (window.jmpNative) window.jmpNative.notifyPlaybackState('Stopped');
+                    });
+            };
+            window._jelliumPlayItem = this.externalPlayItem;
+            if (window._jelliumPendingPlayItem) {
+                const pendingItemId = window._jelliumPendingPlayItem;
+                delete window._jelliumPendingPlayItem;
+                this.externalPlayItem(pendingItemId);
+            }
         }
 
         notifyMetadata(item) {
@@ -350,6 +371,9 @@
         }
 
         destroy() {
+            if (window._jelliumPlayItem === this.externalPlayItem) {
+                delete window._jelliumPlayItem;
+            }
             this.stopPositionUpdates();
             if (this.artworkAbortController) {
                 this.artworkAbortController.abort();
