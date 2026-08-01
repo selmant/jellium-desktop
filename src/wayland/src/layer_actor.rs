@@ -485,10 +485,6 @@ enum Backend {
     Shm { shadow: ShmShadow },
 }
 
-fn hide_detaches(backend: &Backend) -> bool {
-    matches!(backend, Backend::Shm { .. })
-}
-
 /// Only a GPU failure degrades: dmabuf has no CPU fallback, so latching it to
 /// shm would strand the surface with no output.
 fn is_degrading_error(err: &PresentError) -> bool {
@@ -699,23 +695,20 @@ impl Runner {
         self.current = buf;
     }
 
-    /// Returns whether the layer surface was committed. The GPU path leaves the
-    /// surface untouched — Vulkan WSI owns its buffers and an external
-    /// null-attach + commit would fight the swapchain — so it returns `false`.
+    /// Unmap the layer surface. Vulkan WSI owns the GPU surface's buffers, so
+    /// the painter (and therefore its swapchain) must be dropped before the
+    /// null attach. Keeping the painter alive merely stopped future presents
+    /// and left its last opaque frame latched above mpv.
     fn hide(&mut self, layer: &LayerSurface) -> bool {
         if let Backend::Gpu { painter } = &mut self.backend
-            && let Some(painter) = painter.as_mut()
+            && let Some(painter) = painter.take()
         {
-            painter.set_visible(false);
+            painter.shutdown();
         }
-        if hide_detaches(&self.backend) {
-            layer.attach_none();
-            layer.commit();
-            self.set_current(None);
-            true
-        } else {
-            false
-        }
+        layer.attach_none();
+        layer.commit();
+        self.set_current(None);
+        true
     }
 
     fn on_present_error(&mut self, err: PresentError) {
@@ -1332,14 +1325,6 @@ mod tests {
         assert_eq!(route_software(Kind::Gpu, true), Route::Shm);
         assert_eq!(route_software(Kind::Shm, false), Route::Shm);
         assert_eq!(route_software(Kind::Shm, true), Route::Shm);
-    }
-
-    #[test]
-    fn gpu_hide_performs_no_surface_op() {
-        assert!(!hide_detaches(&Backend::Gpu { painter: None }));
-        assert!(hide_detaches(&Backend::Shm {
-            shadow: ShmShadow::default(),
-        }));
     }
 
     #[test]

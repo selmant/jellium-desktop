@@ -75,6 +75,9 @@ impl Inner {
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
+        if self.visible.swap(visible, Ordering::AcqRel) == visible {
+            return;
+        }
         let surface = self.surface_ptr();
         if surface.is_null() {
             return;
@@ -82,6 +85,11 @@ impl Inner {
         if let Some(p) = platform_ops::ops() {
             p.surface_set_visible(surface, visible);
         }
+        // Per-layer visibility must mirror the whole-app hidden path. In
+        // particular, WasHidden(false) tells windowless CEF to produce a fresh
+        // frame immediately; without it a remapped GPU surface can expose the
+        // layer below until the page happens to paint again.
+        self.cef_was_hidden(!visible);
     }
 
     pub(crate) fn try_paste(self: &Arc<Self>) -> bool {
