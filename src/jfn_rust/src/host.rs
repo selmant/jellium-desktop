@@ -3,7 +3,12 @@
 #[cfg(feature = "external-frontend")]
 use std::fmt;
 #[cfg(feature = "external-frontend")]
+use std::sync::Arc;
+#[cfg(feature = "external-frontend")]
 use url::Url;
+
+#[cfg(feature = "external-frontend")]
+use jfn_cef::HostAuthService;
 
 /// A separately hosted web frontend displayed in Jellium's native window.
 #[cfg(feature = "external-frontend")]
@@ -41,10 +46,12 @@ impl ExternalFrontend {
 }
 
 /// Options supplied by a desktop binary hosting the Jellium runtime.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default)]
 pub struct HostOptions {
     #[cfg(feature = "external-frontend")]
     external_frontend: Option<ExternalFrontend>,
+    #[cfg(feature = "external-frontend")]
+    auth_service: Option<Arc<dyn HostAuthService>>,
 }
 
 impl HostOptions {
@@ -52,12 +59,24 @@ impl HostOptions {
     pub fn with_external_frontend(frontend: ExternalFrontend) -> Self {
         Self {
             external_frontend: Some(frontend),
+            auth_service: None,
         }
+    }
+
+    #[cfg(feature = "external-frontend")]
+    pub fn with_auth_service(mut self, service: Arc<dyn HostAuthService>) -> Self {
+        self.auth_service = Some(service);
+        self
     }
 
     #[cfg(feature = "external-frontend")]
     pub(crate) fn external_frontend(&self) -> Option<&ExternalFrontend> {
         self.external_frontend.as_ref()
+    }
+
+    #[cfg(feature = "external-frontend")]
+    pub(crate) fn auth_service(&self) -> Option<Arc<dyn HostAuthService>> {
+        self.auth_service.clone()
     }
 }
 

@@ -22,18 +22,25 @@ use crate::client::{
     jfn_cef_layer_set_visible,
 };
 use crate::ipc::{BrowserMessage, list_string};
+use crate::{HostAuthService, JellyfinSessionBootstrap};
 
 struct ExternalState {
     layer: Arc<Inner>,
     web_layer: Arc<Inner>,
     allowed_origin: String,
     external_visible: bool,
+    auth_service: Option<Arc<dyn HostAuthService>>,
 }
 
 static INSTANCE: Mutex<Option<ExternalState>> = Mutex::new(None);
 
 /// Create the external frontend above the normal Jellyfin Web layer.
-pub fn jfn_external_init(web_layer: *mut JfnCefLayer, start_url: &str, allowed_origin: &str) {
+pub fn jfn_external_init(
+    web_layer: *mut JfnCefLayer,
+    start_url: &str,
+    allowed_origin: &str,
+    auth_service: Option<Arc<dyn HostAuthService>>,
+) {
     if web_layer.is_null() || start_url.is_empty() || allowed_origin.is_empty() {
         return;
     }
@@ -58,6 +65,7 @@ pub fn jfn_external_init(web_layer: *mut JfnCefLayer, start_url: &str, allowed_o
         web_layer: web_inner,
         allowed_origin: allowed_origin.to_string(),
         external_visible: true,
+        auth_service,
     });
 
     unsafe {
@@ -81,7 +89,10 @@ fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {
 }
 
 fn handle_message(message: BrowserMessage) -> bool {
-    if message.name() != "playJellyfinItem" {
+    if !matches!(
+        message.name(),
+        "playJellyfinItem" | "requestAuthChallenge" | "completeAuth"
+    ) {
         return false;
     }
     if !message_origin_allowed(&message) {
@@ -92,6 +103,46 @@ fn handle_message(message: BrowserMessage) -> bool {
         return true;
     };
     let request_id = list_string(args, 0);
+    if message.name() == "requestAuthChallenge" {
+        if !valid_request_id(&request_id) {
+            return true;
+        }
+        let service = INSTANCE
+            .lock()
+            .as_ref()
+            .and_then(|s| s.auth_service.clone());
+        if let Some(challenge) = service.and_then(|s| s.request_challenge(&request_id)) {
+            emit_event_with_payload(
+                "auth-challenge",
+                &request_id,
+                &format!("challenge:'{challenge}'"),
+            );
+        } else {
+            emit_event("error", &request_id);
+        }
+        return true;
+    }
+    if message.name() == "completeAuth" {
+        let ticket = list_string(args, 1);
+        if !valid_request_id(&request_id) || !valid_ticket(&ticket) {
+            return true;
+        }
+        let service = INSTANCE
+            .lock()
+            .as_ref()
+            .and_then(|s| s.auth_service.clone());
+        if let Some(service) = service {
+            service.complete_auth(
+                request_id.clone(),
+                ticket,
+                Box::new(move |result| match result {
+                    Ok(bootstrap) => install_bootstrap(&request_id, bootstrap),
+                    Err(_) => emit_event("error", &request_id),
+                }),
+            );
+        }
+        return true;
+    }
     let item_id = list_string(args, 1);
     if !valid_request_id(&request_id) || !valid_item_id(&item_id) {
         tracing::warn!(target: "ExternalHost", "rejected invalid Jellyfin item id");
@@ -105,12 +156,16 @@ fn handle_message(message: BrowserMessage) -> bool {
 /// Emit only the versioned, non-sensitive command acknowledgement. Results
 /// from playback remain native-owned and use the same event envelope later.
 fn emit_event(kind: &str, request_id: &str) {
+    emit_event_with_payload(kind, request_id, "");
+}
+
+fn emit_event_with_payload(kind: &str, request_id: &str, payload: &str) {
     let instance = INSTANCE.lock();
     let Some(state) = instance.as_ref() else {
         return;
     };
     state.layer.exec_js(&format!(
-        "window.dispatchEvent(new CustomEvent('foreseer:native-event',{{detail:{{protocolVersion:1,requestId:'{request_id}',type:'{kind}'}}}}));"
+        "window.dispatchEvent(new CustomEvent('foreseer:native-event',{{detail:{{protocolVersion:1,requestId:'{request_id}',type:'{kind}',{payload}}}}}));"
     ));
 }
 
@@ -143,6 +198,45 @@ fn valid_request_id(request_id: &str) -> bool {
         && request_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn valid_ticket(ticket: &str) -> bool {
+    ticket.len() == 43
+        && ticket
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn install_bootstrap(request_id: &str, bootstrap: JellyfinSessionBootstrap) {
+    let Ok(server_url) = serde_json::to_string(&bootstrap.server_url) else {
+        return;
+    };
+    let Ok(server_id) = serde_json::to_string(&bootstrap.server_id) else {
+        return;
+    };
+    let Ok(user_id) = serde_json::to_string(&bootstrap.user_id) else {
+        return;
+    };
+    let Ok(device_id) = serde_json::to_string(&bootstrap.device_id) else {
+        return;
+    };
+    let Ok(token) = serde_json::to_string(&bootstrap.access_token) else {
+        return;
+    };
+    let Ok(generation) = serde_json::to_string(&bootstrap.bootstrap_generation) else {
+        return;
+    };
+    let instance = INSTANCE.lock();
+    let Some(state) = instance.as_ref() else {
+        return;
+    };
+    // The bootstrap is delivered only to the private Jellyfin layer. The
+    // compatibility adapter consumes this bounded object in the next phase;
+    // it is never forwarded to the hosted Foreseer page.
+    state.web_layer.exec_js(&format!(
+        "window.__jelliumSessionBootstrap={{serverUrl:{server_url},serverId:{server_id},userId:{user_id},deviceId:{device_id},accessToken:{token},generation:{generation}}};"
+    ));
+    emit_event("ready", request_id);
 }
 
 /// Show Jellyfin Web while native playback is active and restore the external

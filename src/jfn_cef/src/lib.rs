@@ -33,3 +33,25 @@ pub use ffi::*;
 pub const APP_VERSION: &str = env!("JFN_APP_VERSION");
 pub const APP_VERSION_FULL: &str = env!("JFN_APP_VERSION_FULL");
 pub use version::cef_version;
+
+#[cfg(feature = "external-frontend")]
+#[derive(Clone, Debug)]
+pub struct JellyfinSessionBootstrap {
+    pub server_url: String,
+    pub server_id: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub access_token: String,
+    pub bootstrap_generation: String,
+}
+
+#[cfg(feature = "external-frontend")]
+pub trait HostAuthService: Send + Sync {
+    fn request_challenge(&self, request_id: &str) -> Option<String>;
+    fn complete_auth(
+        &self,
+        request_id: String,
+        ticket: String,
+        callback: Box<dyn FnOnce(Result<JellyfinSessionBootstrap, String>) + Send>,
+    );
+}

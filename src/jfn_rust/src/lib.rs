@@ -9,3 +9,5 @@ mod window_geometry;
 pub use host::HostOptions;
 #[cfg(feature = "external-frontend")]
 pub use host::{ConfigError, ExternalFrontend};
+#[cfg(feature = "external-frontend")]
+pub use jfn_cef::{HostAuthService, JellyfinSessionBootstrap};

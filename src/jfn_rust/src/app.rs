@@ -539,6 +539,7 @@ fn init_main_browser(
             main_layer,
             frontend.start_url(),
             frontend.allowed_origin(),
+            host_options.auth_service(),
         );
     }
 

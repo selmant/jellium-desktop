@@ -66,6 +66,10 @@ pub(crate) enum NativeFunction {
     MenuDismissed,
     #[cfg(feature = "external-frontend")]
     PlayJellyfinItem,
+    #[cfg(feature = "external-frontend")]
+    RequestAuthChallenge,
+    #[cfg(feature = "external-frontend")]
+    CompleteAuth,
 }
 
 impl NativeFunction {
@@ -118,6 +122,10 @@ impl NativeFunction {
             "menuDismissed" => Self::MenuDismissed,
             #[cfg(feature = "external-frontend")]
             "playJellyfinItem" => Self::PlayJellyfinItem,
+            #[cfg(feature = "external-frontend")]
+            "requestAuthChallenge" => Self::RequestAuthChallenge,
+            #[cfg(feature = "external-frontend")]
+            "completeAuth" => Self::CompleteAuth,
             _ => return None,
         })
     }
@@ -171,6 +179,10 @@ impl NativeFunction {
             Self::MenuDismissed => "menuDismissed",
             #[cfg(feature = "external-frontend")]
             Self::PlayJellyfinItem => "playJellyfinItem",
+            #[cfg(feature = "external-frontend")]
+            Self::RequestAuthChallenge => "requestAuthChallenge",
+            #[cfg(feature = "external-frontend")]
+            Self::CompleteAuth => "completeAuth",
         }
     }
 }
@@ -293,6 +305,8 @@ const ABOUT_FUNCTIONS: &[NativeFunction] =
 #[cfg(feature = "external-frontend")]
 const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::PlayJellyfinItem,
+    NativeFunction::RequestAuthChallenge,
+    NativeFunction::CompleteAuth,
     NativeFunction::AppExit,
     NativeFunction::WindowMinimize,
     NativeFunction::WindowToggleMaximize,

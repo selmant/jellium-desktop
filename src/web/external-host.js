@@ -8,12 +8,23 @@ Object.defineProperty(window, 'jelliumHost', {
         protocolVersion: 1,
         hostName: 'foreseer-desktop',
         hostVersion: '0.1.0',
-        capabilities: Object.freeze(['play-item', 'window-controls', 'quit']),
-        requestAuthChallenge() {
-            return false;
+        capabilities: Object.freeze(['play-item', 'auth-bootstrap', 'window-controls', 'quit']),
+        requestAuthChallenge(requestId) {
+            if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
+                return false;
+            }
+            window.jmpNative.requestAuthChallenge(requestId);
+            return true;
         },
-        completeAuth() {
-            return false;
+        completeAuth(requestId, ticket) {
+            if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
+                return false;
+            }
+            if (typeof ticket !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(ticket)) {
+                return false;
+            }
+            window.jmpNative.completeAuth(requestId, ticket);
+            return true;
         },
         playItem(requestId, itemId) {
             if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
