@@ -51,8 +51,9 @@ The request is executed inside the existing, authenticated Jellyfin Web layer:
 2. Jellyfin Web's playback manager resolves the media source and starts the
    existing native mpv player.
 3. Jellium keeps the external surface visible until native playback reports it
-   has started, then reveals mpv without exposing the private web controller.
-4. The existing Jellyfin/player layer remains responsible for playback UI.
+   has started, then reveals the private Jellyfin Web player OSD above mpv
+   without exposing setup/login chrome.
+4. Jellyfin Web remains responsible for playback controls and stream control.
 5. Jellium restores the external surface when playback stops.
 
 ## Intentional limits
@@ -62,6 +63,8 @@ The request is executed inside the existing, authenticated Jellyfin Web layer:
 - No Jellyfin access token transfer to the external page.
 - No arbitrary JavaScript evaluation requested by the external page.
 - No external navigation or general plugin system.
+- The stock server-selection overlay is not created. Server identity comes from
+  host auth bootstrap, not from the connect form.
 - The embedding host can provide `HostAuthService` to install an authenticated
   private Jellyfin session without persisting a second token. Playback remains
   unavailable until that session reports matching server and user readiness.

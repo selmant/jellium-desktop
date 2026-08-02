@@ -46,6 +46,11 @@ pub trait MpvHost: Send + Sync {
         None
     }
 
+    /// Re-apply the current host window size to mpv (and related surfaces).
+    /// Used after playback start when the VO may have briefly adopted the
+    /// media's native size instead of the locked host geometry.
+    fn reassert_window_size(&self) {}
+
     /// Sever host↔mpv links that could deadlock teardown. Called
     /// immediately before CEF teardown.
     fn detach(&self) {}

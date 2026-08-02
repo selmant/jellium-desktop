@@ -17,6 +17,7 @@ use url::Url;
 
 use crate::app::userfree_to_string;
 use crate::browsers::{jfn_browsers_create, jfn_browsers_set_active};
+use crate::business_overlay::jfn_overlay_hide;
 use crate::client::{
     Inner, JfnCefLayer, jfn_cef_layer_create, jfn_cef_layer_inner, jfn_cef_layer_set_name,
     jfn_cef_layer_set_visible,
@@ -43,10 +44,10 @@ struct PendingBootstrap {
 
 static INSTANCE: Mutex<Option<ExternalState>> = Mutex::new(None);
 
-/// Create the external frontend above a permanently headless Jellyfin Web
-/// control plane. SDK hosts own the user-facing surface; Jellyfin Web is used
-/// only to resolve streams and report playback, so exposing its login UI would
-/// be both confusing and an unintended fallback.
+/// Create the external frontend above a private Jellyfin Web control plane.
+/// Outside playback the Jellyfin layer stays headless so its login/setup UI
+/// never becomes a user-facing surface; during playback it is shown so the
+/// Video OSD / media controls can sit above mpv.
 pub fn jfn_external_init(
     web_layer: *mut JfnCefLayer,
     start_url: &str,
@@ -85,11 +86,12 @@ pub fn jfn_external_init(
     });
 
     unsafe {
-        // Keep the private Jellyfin layer headless for the entire external
-        // frontend lifetime. It continues to execute JS, network requests and
-        // native playback IPC while CEF stops presenting its surface.
+        // Keep the private Jellyfin layer headless until playback needs its
+        // Video OSD. It still runs JS/network/native playback IPC while hidden.
         jfn_cef_layer_set_visible(web_layer, false);
     }
+    // Stock server-selection overlay must never cover Foreseer or mpv.
+    jfn_overlay_hide();
     unsafe {
         jfn_cef_layer_set_visible(layer, true);
         jfn_cef_layer_create(layer, start_url.as_ptr().cast(), start_url.len());
@@ -202,21 +204,27 @@ fn handle_message(message: BrowserMessage) -> bool {
         tracing::warn!(target: "ExternalHost", "rejected invalid Jellyfin item id");
         return true;
     }
-    let admitted = {
+    let (admitted, replaced) = {
         let mut instance = INSTANCE.lock();
         let Some(state) = instance.as_mut() else {
             return true;
         };
-        if !state.session_ready || state.active_request_id.is_some() {
-            false
+        if !state.session_ready {
+            (false, None)
         } else {
-            state.active_request_id = Some(request_id.clone());
-            true
+            let replaced = state.active_request_id.replace(request_id.clone());
+            (true, replaced)
         }
     };
     if !admitted {
         emit_event("error", &request_id);
         return true;
+    }
+    if let Some(replaced) = replaced {
+        // A prior play was still marked active (common after Video OSD Back when
+        // terminal events race). Release the old request; Jellyfin's play()
+        // replaces any in-flight item without a hard session reset.
+        emit_event("canceled", &replaced);
     }
     emit_event_on_ui("accepted", &request_id);
     crate::business_web::jfn_web_play_item(&item_id);
@@ -530,11 +538,10 @@ fn jfn_external_fail_pending(request_id: &str) {
     }
 }
 
-/// Hide every CEF surface while native playback is active and restore the
-/// external frontend after playback stops. The private Jellyfin Web browser
-/// resolves and controls the stream, but it must never cover the mpv surface:
-/// its login route is opaque and otherwise makes native playback appear to be
-/// a web fallback.
+/// Swap between the hosted external frontend and the private Jellyfin Web
+/// player surface. During playback the web layer must be visible so Jellyfin's
+/// Video OSD / media controls can sit above mpv; outside playback it stays
+/// hidden so setup/login never covers Foreseer or the video surface.
 fn apply_external_visible(show_external: bool) {
     let (external_ptr, web_ptr) = {
         let mut instance = INSTANCE.lock();
@@ -558,34 +565,45 @@ fn apply_external_visible(show_external: bool) {
         show_external,
         "switching visible frontend surface"
     );
+    // Stock server-selection overlay must never cover Foreseer or mpv.
+    jfn_overlay_hide();
     unsafe {
         jfn_cef_layer_set_visible(external_ptr, show_external);
-        // Jellyfin Web continues to service the native player while hidden.
-        // Leaving it mapped here would place its opaque login screen over mpv.
-        jfn_cef_layer_set_visible(web_ptr, false);
+        jfn_cef_layer_set_visible(web_ptr, !show_external);
     }
-    if !show_external {
-        // Wayland GPU surfaces can retain their last opaque frame until their
-        // next compositor transaction. The private Jellyfin document is a
-        // control plane only, so make that frame transparent as a second
-        // guard; its JS continues to report session and playback state.
-        let web_layer = INSTANCE
-            .lock()
-            .as_ref()
-            .map(|state| Arc::clone(&state.web_layer));
-        if let Some(web_layer) = web_layer {
+    let web_layer = INSTANCE
+        .lock()
+        .as_ref()
+        .map(|state| Arc::clone(&state.web_layer));
+    if let Some(web_layer) = web_layer {
+        if show_external {
+            // Keep any retained login/setup frame from painting over Foreseer
+            // between compositor transactions.
             web_layer.exec_js(
                 "document.documentElement.style.setProperty('opacity','0','important');document.documentElement.style.setProperty('background','transparent','important');document.body?.style.setProperty('background','transparent','important');",
             );
+        } else {
+            // Playback owns the surface: restore opacity so Video OSD controls
+            // are visible, keep page chrome transparent around mpv.
+            web_layer.exec_js(
+                "document.documentElement.style.removeProperty('opacity');document.documentElement.style.setProperty('background','transparent','important');document.body?.style.setProperty('background','transparent','important');",
+            );
         }
     }
-    // Native playback owns keyboard and pointer input until its terminal
-    // event restores the hosted frontend.
+    // Route input to the visible surface. During playback that is Jellyfin's
+    // player OSD; otherwise the hosted external frontend.
     jfn_browsers_set_active(if show_external {
         external_ptr
     } else {
-        std::ptr::null_mut()
+        web_ptr
     });
+    if !show_external {
+        // Layer show/hide can leave the Wayland VO on a stale media-sized
+        // configure; refresh locked host geometry now.
+        if let Some(p) = jfn_platform_abi::try_get() {
+            p.mpv_host().reassert_window_size();
+        }
+    }
 }
 
 wrap_task! {
@@ -624,29 +642,22 @@ pub fn jfn_external_start_playback_observer() {
         return;
     }
     jfn_playback::register_event_sink(Box::new(|event| {
-        let kind = match event.kind {
-            jfn_playback::PlaybackEventKind::Started => Some("playing"),
-            jfn_playback::PlaybackEventKind::Finished => Some("finished"),
-            jfn_playback::PlaybackEventKind::Canceled => Some("canceled"),
-            jfn_playback::PlaybackEventKind::Error => Some("error"),
-            _ => None,
-        };
-        let emitted = kind.is_some_and(emit_playback_event);
-        if emitted && matches!(event.kind, jfn_playback::PlaybackEventKind::Started) {
-            show_player_async();
-        }
-        if emitted
-            && matches!(
-                event.kind,
-                jfn_playback::PlaybackEventKind::Finished
-                    | jfn_playback::PlaybackEventKind::Canceled
-                    | jfn_playback::PlaybackEventKind::Error
-            )
-        {
-            if let Some(state) = INSTANCE.lock().as_mut() {
-                state.active_request_id = None;
+        match event.kind {
+            jfn_playback::PlaybackEventKind::Started => {
+                if emit_playback_event("playing") {
+                    show_player_async();
+                }
             }
-            jfn_external_restore_async();
+            jfn_playback::PlaybackEventKind::Finished => {
+                end_external_playback("finished");
+            }
+            jfn_playback::PlaybackEventKind::Canceled => {
+                end_external_playback("canceled");
+            }
+            jfn_playback::PlaybackEventKind::Error => {
+                end_external_playback("error");
+            }
+            _ => {}
         }
     }));
 }
@@ -664,18 +675,34 @@ fn emit_playback_event(kind: &str) -> bool {
     }
 }
 
-/// Use Jellyfin's JS notification only as an early failure fallback. Normal
-/// playback completion is driven by authoritative native coordinator events.
+/// Clear the active play request, restore Foreseer, then notify the page.
+/// Restore runs first so the hosted UI is mapped when the host-event arrives.
+fn end_external_playback(kind: &str) {
+    let request_id = INSTANCE
+        .lock()
+        .as_mut()
+        .and_then(|state| state.active_request_id.take());
+    jfn_external_restore_async();
+    if let Some(request_id) = request_id {
+        // Post after restore so CEF is less likely to drop the event while the
+        // external layer is unmapped.
+        emit_event(kind, &request_id);
+    }
+}
+
+/// Use Jellyfin's JS notification only as an early-failure fallback before
+/// native playback has started. After the player surface is shown, terminal
+/// teardown is owned by the native coordinator so a late `Stopped` cannot
+/// cancel a newer play request.
 pub fn jfn_external_on_playback_state(state: &str) {
-    if state == "Stopped" {
-        let request_id = INSTANCE
-            .lock()
-            .as_mut()
-            .and_then(|state| state.active_request_id.take());
-        if let Some(request_id) = request_id {
-            emit_event("canceled", &request_id);
-        }
-        jfn_external_restore_async();
+    if state != "Stopped" {
+        return;
+    }
+    let should_end = INSTANCE.lock().as_ref().is_some_and(|state| {
+        state.active_request_id.is_some() && state.external_visible
+    });
+    if should_end {
+        end_external_playback("canceled");
     }
 }
 

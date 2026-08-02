@@ -293,9 +293,21 @@
             poster.style.cssText = `position:absolute;top:0;left:0;right:0;bottom:0;background:${bg};`;
 
             const ready = new Promise((resolve) => {
-                if (isNewDlg && options.fullscreen) {
+                // Zoomin is cosmetic. Hidden/unmapped CEF surfaces (common in
+                // external-frontend between play sessions) may never paint, so
+                // animationend never fires and play() would hang before loadfile.
+                const layerHidden =
+                    getComputedStyle(document.documentElement).opacity === '0';
+                if (isNewDlg && options.fullscreen && !layerHidden) {
+                    let settled = false;
+                    const done = () => {
+                        if (settled) return;
+                        settled = true;
+                        resolve();
+                    };
                     dlg.style.animation = 'mpv-video-zoomin 240ms ease-in normal';
-                    dlg.addEventListener('animationend', resolve, { once: true });
+                    dlg.addEventListener('animationend', done, { once: true });
+                    setTimeout(done, 300);
                 } else {
                     resolve();
                 }

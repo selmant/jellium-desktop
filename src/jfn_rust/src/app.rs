@@ -391,6 +391,20 @@ fn start_playback_coordination() -> bool {
         jfn_playback::jfn_shutdown_initiate();
     });
 
+    // First video frames can briefly size the Wayland VO to the media's native
+    // resolution; reassert the locked host geometry (immediate + short deferred)
+    // so letterboxing matches the window without needing a fullscreen toggle.
+    jfn_playback::register_event_sink(Box::new(|event| {
+        if !matches!(event.kind, jfn_playback::PlaybackEventKind::Started) {
+            return;
+        }
+        plat().mpv_host().reassert_window_size();
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            plat().mpv_host().reassert_window_size();
+        });
+    }));
+
     tracing::info!(target: "Main", "[FLOW] starting Rust-owned mpv event thread");
     if !jfn_playback::ingest_driver::jfn_playback_start_mpv_event_thread() {
         tracing::error!(target: "Main", "failed to start mpv event thread");
@@ -529,9 +543,24 @@ fn init_main_browser(
     }
     tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) call returned");
 
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
-    jfn_cef::business_overlay::jfn_overlay_init(main_layer);
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
+    // Foreseer / external hosts own discovery and auth bootstrap. The stock
+    // server-selection overlay would sit above mpv forever if never completed,
+    // so skip it entirely in that mode and unlock theme color as if dismissed.
+    #[cfg(feature = "external-frontend")]
+    let skip_server_overlay = host_options.external_frontend().is_some();
+    #[cfg(not(feature = "external-frontend"))]
+    let skip_server_overlay = false;
+    if skip_server_overlay {
+        tracing::info!(
+            target: "Main",
+            "[FLOW] skipping jfn_overlay_init (external frontend owns UI)"
+        );
+        jfn_color::theme::jfn_theme_color_on_overlay_dismissed();
+    } else {
+        tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
+        jfn_cef::business_overlay::jfn_overlay_init(main_layer);
+        tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
+    }
 
     #[cfg(feature = "external-frontend")]
     if let Some(frontend) = host_options.external_frontend() {
