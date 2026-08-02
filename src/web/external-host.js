@@ -6,9 +6,9 @@ Object.defineProperty(window, 'jelliumHost', {
   writable: false,
   value: Object.freeze({
         protocolVersion: 1,
-        hostName: 'foreseer-desktop',
+        hostName: 'jellium-desktop',
         hostVersion: '0.1.0',
-        capabilities: Object.freeze(['play-item', 'auth-bootstrap', 'window-controls', 'quit']),
+        capabilities: Object.freeze(['play-item', 'auth-bootstrap', 'player-events', 'session-reset', 'window-controls', 'quit']),
         requestAuthChallenge(requestId) {
             if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
                 return false;
@@ -26,6 +26,13 @@ Object.defineProperty(window, 'jelliumHost', {
             window.jmpNative.completeAuth(requestId, ticket);
             return true;
         },
+        clearSession(requestId) {
+            if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
+                return false;
+            }
+            window.jmpNative.clearJellyfinSession(requestId);
+            return true;
+        },
         playItem(requestId, itemId) {
             if (typeof requestId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(requestId)) {
                 return false;
@@ -33,11 +40,7 @@ Object.defineProperty(window, 'jelliumHost', {
             if (typeof itemId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(itemId)) {
                 return false;
             }
-            const admitted = window.jmpNative.playJellyfinItem(requestId, itemId);
-            if (admitted === false) return false;
-            window.dispatchEvent(new CustomEvent('foreseer:native-event', {
-                detail: { protocolVersion: 1, requestId, type: 'accepted' }
-            }));
+            window.jmpNative.playJellyfinItem(requestId, itemId);
             return true;
         },
         minimize() {

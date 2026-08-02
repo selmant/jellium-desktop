@@ -35,7 +35,7 @@ pub const APP_VERSION_FULL: &str = env!("JFN_APP_VERSION_FULL");
 pub use version::cef_version;
 
 #[cfg(feature = "external-frontend")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JellyfinSessionBootstrap {
     pub server_url: String,
     pub server_id: String,
@@ -46,12 +46,44 @@ pub struct JellyfinSessionBootstrap {
 }
 
 #[cfg(feature = "external-frontend")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostAuthError {
+    InvalidRequest,
+    ServerUnreachable,
+    SessionExpired,
+    TicketExpired,
+    TicketUsed,
+    NotLinked,
+    TokenInvalid,
+    UnsupportedMediaServer,
+    InvalidBootstrapResponse,
+}
+
+#[cfg(feature = "external-frontend")]
+impl HostAuthError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::ServerUnreachable => "server_unreachable",
+            Self::SessionExpired => "session_expired",
+            Self::TicketExpired => "ticket_expired",
+            Self::TicketUsed => "ticket_used",
+            Self::NotLinked => "not_linked",
+            Self::TokenInvalid => "token_invalid",
+            Self::UnsupportedMediaServer => "unsupported_media_server",
+            Self::InvalidBootstrapResponse => "invalid_bootstrap_response",
+        }
+    }
+}
+
+#[cfg(feature = "external-frontend")]
 pub trait HostAuthService: Send + Sync {
     fn request_challenge(&self, request_id: &str) -> Option<String>;
+    fn clear_session(&self);
     fn complete_auth(
         &self,
         request_id: String,
         ticket: String,
-        callback: Box<dyn FnOnce(Result<JellyfinSessionBootstrap, String>) + Send>,
+        callback: Box<dyn FnOnce(Result<JellyfinSessionBootstrap, HostAuthError>) + Send>,
     );
 }

@@ -36,7 +36,8 @@ The configured page receives exactly one frozen API:
 
 ```js
 if (window.jelliumHost) {
-    window.jelliumHost.playItem(jellyfinItemId);
+    const requestId = crypto.randomUUID();
+    window.jelliumHost.playItem(requestId, jellyfinItemId);
 }
 ```
 
@@ -49,8 +50,8 @@ The request is executed inside the existing, authenticated Jellyfin Web layer:
 1. The external frontend requests an item ID.
 2. Jellyfin Web's playback manager resolves the media source and starts the
    existing native mpv player.
-3. Jellium hides the external surface immediately before handing the resolved
-   media URL to mpv.
+3. Jellium keeps the external surface visible until native playback reports it
+   has started, then reveals mpv without exposing the private web controller.
 4. The existing Jellyfin/player layer remains responsible for playback UI.
 5. Jellium restores the external surface when playback stops.
 
@@ -61,8 +62,11 @@ The request is executed inside the existing, authenticated Jellyfin Web layer:
 - No Jellyfin access token transfer to the external page.
 - No arbitrary JavaScript evaluation requested by the external page.
 - No external navigation or general plugin system.
-- Jellyfin must already be configured and authenticated in Jellium's internal
-  web profile.
+- The embedding host can provide `HostAuthService` to install an authenticated
+  private Jellyfin session without persisting a second token. Playback remains
+  unavailable until that session reports matching server and user readiness.
+- `clearSession(requestId)` clears the private identity and pending playback on
+  logout or account change.
 
 This boundary is intentionally smaller than a general-purpose Jellium SDK. It
 exists only to support an external discovery/request UI followed by native

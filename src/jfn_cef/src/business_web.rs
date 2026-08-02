@@ -117,6 +117,16 @@ pub fn jfn_web_play_item(item_id: &str) {
     ));
 }
 
+#[cfg(feature = "external-frontend")]
+pub fn jfn_web_clear_session() {
+    jfn_mpv_stop();
+    let inner = match INSTANCE.lock().as_ref() {
+        Some(state) => Arc::clone(&state.layer),
+        None => return,
+    };
+    inner.exec_js("window._jelliumClearSession?.();location.replace('about:blank');");
+}
+
 fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {
     let l = unsafe { &*layer };
 
@@ -235,15 +245,16 @@ fn handle_player_load(args: &ListValue) {
     } else {
         false
     };
-    #[cfg(feature = "external-frontend")]
-    crate::business_external::jfn_external_show_player();
     jfn_logging::log(
         jfn_logging::CATEGORY_CEF,
         jfn_logging::LEVEL_INFO,
         &format!(
             "playerLoad: video={video_idx} audio={audio_idx} sub={sub_idx} \
              start={start_ms}ms infinite={is_infinite_stream} \
-             extAudio={external_audio_url} extSub={external_sub_url} url={url}"
+             hasExtAudio={} hasExtSub={} hasUrl={}",
+            !external_audio_url.is_empty(),
+            !external_sub_url.is_empty(),
+            !url.is_empty(),
         ),
     );
 
@@ -342,7 +353,7 @@ fn handle_message(message: BrowserMessage) -> bool {
             jfn_logging::log(
                 jfn_logging::CATEGORY_CEF,
                 jfn_logging::LEVEL_INFO,
-                &format!("playerAddSubtitle: {url}"),
+                "playerAddSubtitle: URL received",
             );
             if let Some(c) = js_cstr_or_warn("playerAddSubtitle url", &url) {
                 unsafe { jfn_mpv_sub_add(c.as_ptr()) };
@@ -356,7 +367,7 @@ fn handle_message(message: BrowserMessage) -> bool {
             jfn_logging::log(
                 jfn_logging::CATEGORY_CEF,
                 jfn_logging::LEVEL_INFO,
-                &format!("playerAddAudio: {url}"),
+                "playerAddAudio: URL received",
             );
             if let Some(c) = js_cstr_or_warn("playerAddAudio url", &url) {
                 unsafe { jfn_mpv_audio_add(c.as_ptr()) };
@@ -434,12 +445,17 @@ fn handle_message(message: BrowserMessage) -> bool {
                 true
             }
         }
+        #[cfg(feature = "external-frontend")]
         "jellyfinSessionReady" => with_args(args, |a| {
-            #[cfg(feature = "external-frontend")]
             crate::business_external::jfn_external_on_session_ready(
                 &list_string(a, 0),
                 &list_string(a, 1),
+                &list_string(a, 2),
             );
+        }),
+        #[cfg(feature = "external-frontend")]
+        "jellyfinSessionFailed" => with_args(args, |a| {
+            crate::business_external::jfn_external_on_session_failed(&list_string(a, 0));
         }),
         "notifySeek" => with_args(args, |a| {
             pb_post(PbInput::Seeked(list_int(a, 0) as i64 * 1000));

@@ -700,6 +700,7 @@ impl Runner {
     /// null attach. Keeping the painter alive merely stopped future presents
     /// and left its last opaque frame latched above mpv.
     fn hide(&mut self, layer: &LayerSurface) -> bool {
+        tracing::debug!("hiding Wayland CEF layer surface");
         if let Backend::Gpu { painter } = &mut self.backend
             && let Some(painter) = painter.take()
         {

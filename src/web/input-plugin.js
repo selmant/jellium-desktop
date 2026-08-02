@@ -5,6 +5,7 @@
             this.type = 'input';
             this.id = 'inputPlugin';
             this.playbackManager = playbackManager;
+            window._jelliumPlaybackManager = playbackManager;
             this.inputManager = inputManager;
             this.positionInterval = null;
             this.artworkAbortController = null;
@@ -373,6 +374,9 @@
         destroy() {
             if (window._jelliumPlayItem === this.externalPlayItem) {
                 delete window._jelliumPlayItem;
+            }
+            if (window._jelliumPlaybackManager === this.playbackManager) {
+                delete window._jelliumPlaybackManager;
             }
             this.stopPositionUpdates();
             if (this.artworkAbortController) {

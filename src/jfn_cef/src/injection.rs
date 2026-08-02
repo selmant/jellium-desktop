@@ -72,6 +72,10 @@ pub(crate) enum NativeFunction {
     CompleteAuth,
     #[cfg(feature = "external-frontend")]
     JellyfinSessionReady,
+    #[cfg(feature = "external-frontend")]
+    JellyfinSessionFailed,
+    #[cfg(feature = "external-frontend")]
+    ClearJellyfinSession,
 }
 
 impl NativeFunction {
@@ -130,6 +134,10 @@ impl NativeFunction {
             "completeAuth" => Self::CompleteAuth,
             #[cfg(feature = "external-frontend")]
             "jellyfinSessionReady" => Self::JellyfinSessionReady,
+            #[cfg(feature = "external-frontend")]
+            "jellyfinSessionFailed" => Self::JellyfinSessionFailed,
+            #[cfg(feature = "external-frontend")]
+            "clearJellyfinSession" => Self::ClearJellyfinSession,
             _ => return None,
         })
     }
@@ -189,6 +197,10 @@ impl NativeFunction {
             Self::CompleteAuth => "completeAuth",
             #[cfg(feature = "external-frontend")]
             Self::JellyfinSessionReady => "jellyfinSessionReady",
+            #[cfg(feature = "external-frontend")]
+            Self::JellyfinSessionFailed => "jellyfinSessionFailed",
+            #[cfg(feature = "external-frontend")]
+            Self::ClearJellyfinSession => "clearJellyfinSession",
         }
     }
 }
@@ -289,6 +301,10 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::ThemeColor,
     NativeFunction::SetOsdVisible,
     NativeFunction::ToggleFullscreen,
+    #[cfg(feature = "external-frontend")]
+    NativeFunction::JellyfinSessionReady,
+    #[cfg(feature = "external-frontend")]
+    NativeFunction::JellyfinSessionFailed,
 ];
 
 const WEB_SCRIPTS: &[InjectedScript] = &[
@@ -298,6 +314,7 @@ const WEB_SCRIPTS: &[InjectedScript] = &[
     InjectedScript::MpvAudioPlayer,
     InjectedScript::InputPlugin,
     InjectedScript::ClientSettings,
+    #[cfg(feature = "external-frontend")]
     InjectedScript::JellyfinSession,
 ];
 const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
@@ -317,7 +334,7 @@ const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::PlayJellyfinItem,
     NativeFunction::RequestAuthChallenge,
     NativeFunction::CompleteAuth,
-    NativeFunction::JellyfinSessionReady,
+    NativeFunction::ClearJellyfinSession,
     NativeFunction::AppExit,
     NativeFunction::WindowMinimize,
     NativeFunction::WindowToggleMaximize,

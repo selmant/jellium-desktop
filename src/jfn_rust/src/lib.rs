@@ -10,4 +10,4 @@ pub use host::HostOptions;
 #[cfg(feature = "external-frontend")]
 pub use host::{ConfigError, ExternalFrontend};
 #[cfg(feature = "external-frontend")]
-pub use jfn_cef::{HostAuthService, JellyfinSessionBootstrap};
+pub use jfn_cef::{HostAuthError, HostAuthService, JellyfinSessionBootstrap};
