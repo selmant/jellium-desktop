@@ -64,6 +64,9 @@ pub fn jfn_cef_set_remote_debugging_port(port: c_int) {
 }
 
 pub fn jfn_cef_set_disable_gpu_compositing(disable: bool) {
+    // Explicit opt-out only. Do not couple this to shared-texture availability:
+    // Chromium GPU compositing accelerates page CSS independently of whether
+    // the host presents CEF frames via dmabuf or CPU/GPU upload.
     if disable {
         state::with_config(|c| {
             c.pending_switches.push(state::PendingSwitch {

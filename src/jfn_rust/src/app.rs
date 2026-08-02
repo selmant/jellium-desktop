@@ -352,8 +352,17 @@ fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
 fn initialize_cef(ba: &BootArgs, use_shared_textures: bool) -> bool {
     jfn_cef::ffi::jfn_cef_set_log_severity(cef_severity_for_cef_filter());
     jfn_cef::ffi::jfn_cef_set_remote_debugging_port(ba.remote_debugging_port);
-    jfn_cef::ffi::jfn_cef_set_disable_gpu_compositing(!use_shared_textures);
+    // Shared textures are a zero-copy *host presentation* path. Falling back
+    // to software/GPU-upload paint must not disable Chromium's own GPU
+    // compositor — that is what accelerates CSS blur/transforms in the UI.
+    // Only honor the explicit CLI/settings opt-out.
+    jfn_cef::ffi::jfn_cef_set_disable_gpu_compositing(ba.disable_gpu_compositing);
     jfn_cef::ffi::jfn_cef_set_platform_switches(plat().display());
+    tracing::info!(
+        target: "Main",
+        "CEF init: shared_textures={use_shared_textures} disable_gpu_compositing={}",
+        ba.disable_gpu_compositing
+    );
     tracing::info!(target: "Main", "[FLOW] calling CefInitialize...");
     if !jfn_cef::ffi::jfn_cef_initialize() {
         tracing::error!(target: "Main", "CefInitialize failed");
