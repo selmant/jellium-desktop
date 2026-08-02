@@ -291,7 +291,13 @@ const ABOUT_FUNCTIONS: &[NativeFunction] =
     &[NativeFunction::AboutOpenPath, NativeFunction::AboutDismiss];
 
 #[cfg(feature = "external-frontend")]
-const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[NativeFunction::PlayJellyfinItem];
+const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[
+    NativeFunction::PlayJellyfinItem,
+    NativeFunction::AppExit,
+    NativeFunction::WindowMinimize,
+    NativeFunction::WindowToggleMaximize,
+    NativeFunction::ToggleFullscreen,
+];
 #[cfg(feature = "external-frontend")]
 const EXTERNAL_SCRIPTS: &[InjectedScript] = &[InjectedScript::ExternalHost];
 

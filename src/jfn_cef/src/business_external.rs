@@ -91,13 +91,27 @@ fn handle_message(message: BrowserMessage) -> bool {
     let Some(args) = message.args() else {
         return true;
     };
-    let item_id = list_string(args, 0);
-    if !valid_item_id(&item_id) {
+    let request_id = list_string(args, 0);
+    let item_id = list_string(args, 1);
+    if !valid_request_id(&request_id) || !valid_item_id(&item_id) {
         tracing::warn!(target: "ExternalHost", "rejected invalid Jellyfin item id");
         return true;
     }
     crate::business_web::jfn_web_play_item(&item_id);
+    emit_event("accepted", &request_id);
     true
+}
+
+/// Emit only the versioned, non-sensitive command acknowledgement. Results
+/// from playback remain native-owned and use the same event envelope later.
+fn emit_event(kind: &str, request_id: &str) {
+    let instance = INSTANCE.lock();
+    let Some(state) = instance.as_ref() else {
+        return;
+    };
+    state.layer.exec_js(&format!(
+        "window.dispatchEvent(new CustomEvent('foreseer:native-event',{{detail:{{protocolVersion:1,requestId:'{request_id}',type:'{kind}'}}}}));"
+    ));
 }
 
 fn message_origin_allowed(message: &BrowserMessage) -> bool {
@@ -119,6 +133,14 @@ fn valid_item_id(item_id: &str) -> bool {
     !item_id.is_empty()
         && item_id.len() <= 128
         && item_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn valid_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 64
+        && request_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
@@ -206,7 +228,7 @@ pub fn jfn_external_on_playback_state(state: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{url_origin_matches, valid_item_id};
+    use super::{url_origin_matches, valid_item_id, valid_request_id};
 
     #[test]
     fn accepts_normal_jellyfin_ids() {
@@ -219,6 +241,14 @@ mod tests {
         assert!(!valid_item_id(""));
         assert!(!valid_item_id(&"a".repeat(129)));
         assert!(!valid_item_id("x');window.bad=true;//"));
+    }
+
+    #[test]
+    fn validates_request_ids() {
+        assert!(valid_request_id("play-123"));
+        assert!(!valid_request_id(""));
+        assert!(!valid_request_id("request id"));
+        assert!(!valid_request_id(&"a".repeat(65)));
     }
 
     #[test]
