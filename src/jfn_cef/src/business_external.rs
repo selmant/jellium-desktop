@@ -30,6 +30,13 @@ struct ExternalState {
     allowed_origin: String,
     external_visible: bool,
     auth_service: Option<Arc<dyn HostAuthService>>,
+    pending_bootstrap: Option<PendingBootstrap>,
+}
+
+struct PendingBootstrap {
+    request_id: String,
+    server_id: String,
+    user_id: String,
 }
 
 static INSTANCE: Mutex<Option<ExternalState>> = Mutex::new(None);
@@ -66,6 +73,7 @@ pub fn jfn_external_init(
         allowed_origin: allowed_origin.to_string(),
         external_visible: true,
         auth_service,
+        pending_bootstrap: None,
     });
 
     unsafe {
@@ -91,7 +99,7 @@ fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {
 fn handle_message(message: BrowserMessage) -> bool {
     if !matches!(
         message.name(),
-        "playJellyfinItem" | "requestAuthChallenge" | "completeAuth"
+        "playJellyfinItem" | "requestAuthChallenge" | "completeAuth" | "jellyfinSessionReady"
     ) {
         return false;
     }
@@ -102,6 +110,12 @@ fn handle_message(message: BrowserMessage) -> bool {
     let Some(args) = message.args() else {
         return true;
     };
+    if message.name() == "jellyfinSessionReady" {
+        let server_id = list_string(args, 0);
+        let user_id = list_string(args, 1);
+        jfn_external_on_session_ready(&server_id, &user_id);
+        return true;
+    }
     let request_id = list_string(args, 0);
     if message.name() == "requestAuthChallenge" {
         if !valid_request_id(&request_id) {
@@ -236,7 +250,39 @@ fn install_bootstrap(request_id: &str, bootstrap: JellyfinSessionBootstrap) {
     state.web_layer.exec_js(&format!(
         "window.__jelliumSessionBootstrap={{serverUrl:{server_url},serverId:{server_id},userId:{user_id},deviceId:{device_id},accessToken:{token},generation:{generation}}};"
     ));
-    emit_event("ready", request_id);
+    let mut instance = INSTANCE.lock();
+    if let Some(state) = instance.as_mut() {
+        state.pending_bootstrap = Some(PendingBootstrap {
+            request_id: request_id.to_string(),
+            server_id: bootstrap.server_id,
+            user_id: bootstrap.user_id,
+        });
+    }
+}
+
+/// Complete the auth exchange only after the private Jellyfin Web layer has
+/// accepted the bootstrap through its live ApiClient.
+pub fn jfn_external_on_session_ready(server_id: &str, user_id: &str) {
+    let request_id = {
+        let mut instance = INSTANCE.lock();
+        let Some(state) = instance.as_mut() else {
+            return;
+        };
+        let Some(pending) = state.pending_bootstrap.as_ref() else {
+            return;
+        };
+        if pending.server_id != server_id || pending.user_id != user_id {
+            tracing::warn!(target: "ExternalHost", "rejected unmatched Jellyfin session acknowledgement");
+            return;
+        }
+        state
+            .pending_bootstrap
+            .take()
+            .map(|pending| pending.request_id)
+    };
+    if let Some(request_id) = request_id {
+        emit_event("ready", &request_id);
+    }
 }
 
 /// Show Jellyfin Web while native playback is active and restore the external

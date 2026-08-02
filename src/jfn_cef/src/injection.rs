@@ -70,6 +70,8 @@ pub(crate) enum NativeFunction {
     RequestAuthChallenge,
     #[cfg(feature = "external-frontend")]
     CompleteAuth,
+    #[cfg(feature = "external-frontend")]
+    JellyfinSessionReady,
 }
 
 impl NativeFunction {
@@ -126,6 +128,8 @@ impl NativeFunction {
             "requestAuthChallenge" => Self::RequestAuthChallenge,
             #[cfg(feature = "external-frontend")]
             "completeAuth" => Self::CompleteAuth,
+            #[cfg(feature = "external-frontend")]
+            "jellyfinSessionReady" => Self::JellyfinSessionReady,
             _ => return None,
         })
     }
@@ -183,6 +187,8 @@ impl NativeFunction {
             Self::RequestAuthChallenge => "requestAuthChallenge",
             #[cfg(feature = "external-frontend")]
             Self::CompleteAuth => "completeAuth",
+            #[cfg(feature = "external-frontend")]
+            Self::JellyfinSessionReady => "jellyfinSessionReady",
         }
     }
 }
@@ -311,6 +317,7 @@ const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::PlayJellyfinItem,
     NativeFunction::RequestAuthChallenge,
     NativeFunction::CompleteAuth,
+    NativeFunction::JellyfinSessionReady,
     NativeFunction::AppExit,
     NativeFunction::WindowMinimize,
     NativeFunction::WindowToggleMaximize,

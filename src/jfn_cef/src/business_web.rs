@@ -434,6 +434,13 @@ fn handle_message(message: BrowserMessage) -> bool {
                 true
             }
         }
+        "jellyfinSessionReady" => with_args(args, |a| {
+            #[cfg(feature = "external-frontend")]
+            crate::business_external::jfn_external_on_session_ready(
+                &list_string(a, 0),
+                &list_string(a, 1),
+            );
+        }),
         "notifySeek" => with_args(args, |a| {
             pb_post(PbInput::Seeked(list_int(a, 0) as i64 * 1000));
         }),
