@@ -31,6 +31,7 @@ struct ExternalState {
     external_visible: bool,
     auth_service: Option<Arc<dyn HostAuthService>>,
     pending_bootstrap: Option<PendingBootstrap>,
+    active_request_id: Option<String>,
 }
 
 struct PendingBootstrap {
@@ -74,6 +75,7 @@ pub fn jfn_external_init(
         external_visible: true,
         auth_service,
         pending_bootstrap: None,
+        active_request_id: None,
     });
 
     unsafe {
@@ -162,8 +164,10 @@ fn handle_message(message: BrowserMessage) -> bool {
         tracing::warn!(target: "ExternalHost", "rejected invalid Jellyfin item id");
         return true;
     }
+    if let Some(state) = INSTANCE.lock().as_mut() {
+        state.active_request_id = Some(request_id.clone());
+    }
     crate::business_web::jfn_web_play_item(&item_id);
-    emit_event("accepted", &request_id);
     true
 }
 
@@ -347,15 +351,38 @@ pub fn jfn_external_start_playback_observer() {
         return;
     }
     jfn_playback::register_event_sink(Box::new(|event| {
+        let kind = match event.kind {
+            jfn_playback::PlaybackEventKind::Started => Some("playing"),
+            jfn_playback::PlaybackEventKind::Finished => Some("finished"),
+            jfn_playback::PlaybackEventKind::Canceled => Some("canceled"),
+            jfn_playback::PlaybackEventKind::Error => Some("error"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            emit_playback_event(kind);
+        }
         if matches!(
             event.kind,
             jfn_playback::PlaybackEventKind::Finished
                 | jfn_playback::PlaybackEventKind::Canceled
                 | jfn_playback::PlaybackEventKind::Error
         ) {
+            if let Some(state) = INSTANCE.lock().as_mut() {
+                state.active_request_id = None;
+            }
             jfn_external_restore_async();
         }
     }));
+}
+
+fn emit_playback_event(kind: &str) {
+    let request_id = INSTANCE
+        .lock()
+        .as_ref()
+        .and_then(|state| state.active_request_id.clone());
+    if let Some(request_id) = request_id {
+        emit_event(kind, &request_id);
+    }
 }
 
 /// Use Jellyfin's JS notification only as an early failure fallback. Normal
