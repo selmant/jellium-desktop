@@ -126,9 +126,11 @@ fn install_mpv_close_binding(raw: *mut jfn_mpv::sys::mpv_handle) {
 }
 
 fn setup_mpv_environment() {
-    let mpv_home = jfn_paths::mpv_home();
-    unsafe {
-        std::env::set_var("MPV_HOME", &mpv_home);
+    if std::env::var_os("MPV_HOME").is_none() {
+        let mpv_home = jfn_paths::mpv_home();
+        unsafe {
+            std::env::set_var("MPV_HOME", &mpv_home);
+        }
     }
 
     plat()

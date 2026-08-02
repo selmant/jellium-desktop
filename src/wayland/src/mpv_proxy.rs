@@ -115,9 +115,7 @@ pub(crate) fn reassert_window_size() {
     );
     set_window_size(size);
     if let Some(ext) = crate::window_state::window_extent() {
-        crate::wl_ops::on_configure(
-            ext.mode() == crate::window_state::WindowMode::Fullscreen,
-        );
+        crate::wl_ops::on_configure(ext.mode() == crate::window_state::WindowMode::Fullscreen);
     }
     crate::root_window::request_present();
 }

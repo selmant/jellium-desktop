@@ -92,12 +92,22 @@ pub fn config_dir() -> PathBuf {
     if let Some(path) = config_override() {
         return ensure(path);
     }
+    if let Ok(env_path) = env::var("JELLIUM_DESKTOP_CONFIG_DIR") {
+        if !env_path.is_empty() {
+            return ensure(PathBuf::from(env_path));
+        }
+    }
     ensure(imp::config_base().join(APP_DIR_NAME))
 }
 
 pub fn cache_dir() -> PathBuf {
     if let Some(path) = cache_override() {
         return ensure(path);
+    }
+    if let Ok(env_path) = env::var("JELLIUM_DESKTOP_CACHE_DIR") {
+        if !env_path.is_empty() {
+            return ensure(PathBuf::from(env_path));
+        }
     }
     ensure(imp::cache_base().join(APP_DIR_NAME))
 }
@@ -125,3 +135,15 @@ pub fn default_log_file() -> Option<PathBuf> {
 #[cfg_attr(target_os = "macos", path = "imp_macos.rs")]
 #[cfg_attr(windows, path = "imp_windows.rs")]
 mod imp;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mpv_home_is_inside_config_dir() {
+        let home = mpv_home();
+        assert!(home.ends_with("mpv"));
+        assert_eq!(home.parent().unwrap(), config_dir());
+    }
+}

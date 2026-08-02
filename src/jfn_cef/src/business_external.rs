@@ -592,11 +592,7 @@ fn apply_external_visible(show_external: bool) {
     }
     // Route input to the visible surface. During playback that is Jellyfin's
     // player OSD; otherwise the hosted external frontend.
-    jfn_browsers_set_active(if show_external {
-        external_ptr
-    } else {
-        web_ptr
-    });
+    jfn_browsers_set_active(if show_external { external_ptr } else { web_ptr });
     if !show_external {
         // Layer show/hide can leave the Wayland VO on a stale media-sized
         // configure; refresh locked host geometry now.
@@ -641,24 +637,22 @@ pub fn jfn_external_start_playback_observer() {
     if INSTANCE.lock().is_none() {
         return;
     }
-    jfn_playback::register_event_sink(Box::new(|event| {
-        match event.kind {
-            jfn_playback::PlaybackEventKind::Started => {
-                if emit_playback_event("playing") {
-                    show_player_async();
-                }
+    jfn_playback::register_event_sink(Box::new(|event| match event.kind {
+        jfn_playback::PlaybackEventKind::Started => {
+            if emit_playback_event("playing") {
+                show_player_async();
             }
-            jfn_playback::PlaybackEventKind::Finished => {
-                end_external_playback("finished");
-            }
-            jfn_playback::PlaybackEventKind::Canceled => {
-                end_external_playback("canceled");
-            }
-            jfn_playback::PlaybackEventKind::Error => {
-                end_external_playback("error");
-            }
-            _ => {}
         }
+        jfn_playback::PlaybackEventKind::Finished => {
+            end_external_playback("finished");
+        }
+        jfn_playback::PlaybackEventKind::Canceled => {
+            end_external_playback("canceled");
+        }
+        jfn_playback::PlaybackEventKind::Error => {
+            end_external_playback("error");
+        }
+        _ => {}
     }));
 }
 
@@ -698,9 +692,10 @@ pub fn jfn_external_on_playback_state(state: &str) {
     if state != "Stopped" {
         return;
     }
-    let should_end = INSTANCE.lock().as_ref().is_some_and(|state| {
-        state.active_request_id.is_some() && state.external_visible
-    });
+    let should_end = INSTANCE
+        .lock()
+        .as_ref()
+        .is_some_and(|state| state.active_request_id.is_some() && state.external_visible);
     if should_end {
         end_external_playback("canceled");
     }
