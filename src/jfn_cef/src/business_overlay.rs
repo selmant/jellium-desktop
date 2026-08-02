@@ -27,6 +27,7 @@ use jfn_color::theme::jfn_theme_color_on_overlay_dismissed;
 use jfn_jellyfin::{extract_base_url, is_valid_public_info, normalize_input};
 
 struct OverlayState {
+    layer: Arc<Inner>,
     main_layer: Arc<Inner>,
     active_probe: Option<Urlrequest>,
 }
@@ -63,9 +64,29 @@ pub fn jfn_overlay_init(main_layer: *mut JfnCefLayer) {
 
     let main_inner = unsafe { jfn_cef_layer_inner(main_layer) };
     *INSTANCE.lock() = Some(OverlayState {
+        layer: Arc::clone(&inner),
         main_layer: main_inner,
         active_probe: None,
     });
+}
+
+/// Unmap the server-selection overlay so it cannot cover mpv or an external
+/// frontend. No-op when the overlay was never created.
+pub fn jfn_overlay_hide() {
+    let layer_ptr = {
+        let instance = INSTANCE.lock();
+        let Some(state) = instance.as_ref() else {
+            return;
+        };
+        state.layer.layer_ptr()
+    };
+    if layer_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        jfn_cef_layer_set_visible(layer_ptr, false);
+    }
+    jfn_theme_color_on_overlay_dismissed();
 }
 
 fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {

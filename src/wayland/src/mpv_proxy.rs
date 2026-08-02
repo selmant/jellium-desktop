@@ -100,6 +100,28 @@ pub(crate) fn set_window_size(size: WindowSize) {
     wake_mpv_thread();
 }
 
+/// Re-send the current host size to mpv. First video frames often reconfigure
+/// the VO to the media size before the locked host geometry sticks; a forced
+/// configure (same effect as a fullscreen toggle) snaps letterboxing back.
+pub(crate) fn reassert_window_size() {
+    let Some(size) = window_size() else {
+        return;
+    };
+    tracing::debug!(
+        target: "MpvProxy",
+        w = size.w(),
+        h = size.h(),
+        "reasserting mpv window size after playback start"
+    );
+    set_window_size(size);
+    if let Some(ext) = crate::window_state::window_extent() {
+        crate::wl_ops::on_configure(
+            ext.mode() == crate::window_state::WindowMode::Fullscreen,
+        );
+    }
+    crate::root_window::request_present();
+}
+
 fn wake_mpv_thread() {
     if let Some(wake) = MPV_WAKE.lock().as_ref() {
         wake.signal();

@@ -46,6 +46,28 @@ use jfn_platform_abi::{EffectiveDecorations, WindowDecorations};
 const APP_ID: &str = "net.nullsum.JelliumDesktop";
 const TITLE: &str = "Jellium Desktop";
 
+fn product_title() -> String {
+    std::env::var("JELLIUM_DESKTOP_TITLE")
+        .ok()
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .unwrap_or_else(|| TITLE.to_owned())
+}
+
+fn product_app_id() -> String {
+    std::env::var("JELLIUM_DESKTOP_APP_ID")
+        .ok()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+        .unwrap_or_else(|| APP_ID.to_owned())
+}
+
 // Background behind the video/overlay, matching kBgColor (0x101010).
 const BG: [u8; 3] = [0x10, 0x10, 0x10];
 
@@ -1007,8 +1029,8 @@ pub(crate) fn ensure_started() {
     }
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
     let toplevel = xdg_surface.get_toplevel(&qh, ());
-    toplevel.set_title(TITLE.to_owned());
-    toplevel.set_app_id(APP_ID.to_owned());
+    toplevel.set_title(product_title());
+    toplevel.set_app_id(product_app_id());
 
     let (boot_w, boot_h, boot_max) = boot_geometry();
     if boot_max {

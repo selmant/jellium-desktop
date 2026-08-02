@@ -99,6 +99,34 @@ pub unsafe fn jfn_web_exec_js(js_utf8: *const c_char) {
     inner.exec_js(&js);
 }
 
+/// Ask the embedded Jellyfin Web playback manager to play an item.
+///
+/// Calls made before Jellyfin's input plugin is ready are held by the page and
+/// consumed when the plugin is constructed.
+#[cfg(feature = "external-frontend")]
+pub fn jfn_web_play_item(item_id: &str) {
+    let inner = match INSTANCE.lock().as_ref() {
+        Some(state) => Arc::clone(&state.layer),
+        None => return,
+    };
+    let Ok(item_id) = serde_json::to_string(item_id) else {
+        return;
+    };
+    inner.exec_js(&format!(
+        "if(window._jelliumPlayItem)window._jelliumPlayItem({item_id});else window._jelliumPendingPlayItem={item_id};"
+    ));
+}
+
+#[cfg(feature = "external-frontend")]
+pub fn jfn_web_clear_session() {
+    jfn_mpv_stop();
+    let inner = match INSTANCE.lock().as_ref() {
+        Some(state) => Arc::clone(&state.layer),
+        None => return,
+    };
+    inner.exec_js("window._jelliumClearSession?.();location.replace('about:blank');");
+}
+
 fn install_handlers(layer: *mut JfnCefLayer, inner_for_created: Arc<Inner>) {
     let l = unsafe { &*layer };
 
@@ -223,7 +251,10 @@ fn handle_player_load(args: &ListValue) {
         &format!(
             "playerLoad: video={video_idx} audio={audio_idx} sub={sub_idx} \
              start={start_ms}ms infinite={is_infinite_stream} \
-             extAudio={external_audio_url} extSub={external_sub_url} url={url}"
+             hasExtAudio={} hasExtSub={} hasUrl={}",
+            !external_audio_url.is_empty(),
+            !external_sub_url.is_empty(),
+            !url.is_empty(),
         ),
     );
 
@@ -322,7 +353,7 @@ fn handle_message(message: BrowserMessage) -> bool {
             jfn_logging::log(
                 jfn_logging::CATEGORY_CEF,
                 jfn_logging::LEVEL_INFO,
-                &format!("playerAddSubtitle: {url}"),
+                "playerAddSubtitle: URL received",
             );
             if let Some(c) = js_cstr_or_warn("playerAddSubtitle url", &url) {
                 unsafe { jfn_mpv_sub_add(c.as_ptr()) };
@@ -336,7 +367,7 @@ fn handle_message(message: BrowserMessage) -> bool {
             jfn_logging::log(
                 jfn_logging::CATEGORY_CEF,
                 jfn_logging::LEVEL_INFO,
-                &format!("playerAddAudio: {url}"),
+                "playerAddAudio: URL received",
             );
             if let Some(c) = js_cstr_or_warn("playerAddAudio url", &url) {
                 unsafe { jfn_mpv_audio_add(c.as_ptr()) };
@@ -401,9 +432,31 @@ fn handle_message(message: BrowserMessage) -> bool {
             });
         }),
         "notifyPlaybackState" => {
-            // mpv is the authoritative source via coordinator; ignore JS hint.
-            true
+            // mpv remains authoritative for playback state. The JS hint is
+            // used only to switch the optional external frontend surface.
+            #[cfg(feature = "external-frontend")]
+            {
+                with_args(args, |a| {
+                    crate::business_external::jfn_external_on_playback_state(&list_string(a, 0));
+                })
+            }
+            #[cfg(not(feature = "external-frontend"))]
+            {
+                true
+            }
         }
+        #[cfg(feature = "external-frontend")]
+        "jellyfinSessionReady" => with_args(args, |a| {
+            crate::business_external::jfn_external_on_session_ready(
+                &list_string(a, 0),
+                &list_string(a, 1),
+                &list_string(a, 2),
+            );
+        }),
+        #[cfg(feature = "external-frontend")]
+        "jellyfinSessionFailed" => with_args(args, |a| {
+            crate::business_external::jfn_external_on_session_failed(&list_string(a, 0));
+        }),
         "notifySeek" => with_args(args, |a| {
             pb_post(PbInput::Seeked(list_int(a, 0) as i64 * 1000));
         }),

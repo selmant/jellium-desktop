@@ -64,6 +64,18 @@ pub(crate) enum NativeFunction {
     CsdReady,
     MenuItemSelected,
     MenuDismissed,
+    #[cfg(feature = "external-frontend")]
+    PlayJellyfinItem,
+    #[cfg(feature = "external-frontend")]
+    RequestAuthChallenge,
+    #[cfg(feature = "external-frontend")]
+    CompleteAuth,
+    #[cfg(feature = "external-frontend")]
+    JellyfinSessionReady,
+    #[cfg(feature = "external-frontend")]
+    JellyfinSessionFailed,
+    #[cfg(feature = "external-frontend")]
+    ClearJellyfinSession,
 }
 
 impl NativeFunction {
@@ -114,6 +126,18 @@ impl NativeFunction {
             "csdReady" => Self::CsdReady,
             "menuItemSelected" => Self::MenuItemSelected,
             "menuDismissed" => Self::MenuDismissed,
+            #[cfg(feature = "external-frontend")]
+            "playJellyfinItem" => Self::PlayJellyfinItem,
+            #[cfg(feature = "external-frontend")]
+            "requestAuthChallenge" => Self::RequestAuthChallenge,
+            #[cfg(feature = "external-frontend")]
+            "completeAuth" => Self::CompleteAuth,
+            #[cfg(feature = "external-frontend")]
+            "jellyfinSessionReady" => Self::JellyfinSessionReady,
+            #[cfg(feature = "external-frontend")]
+            "jellyfinSessionFailed" => Self::JellyfinSessionFailed,
+            #[cfg(feature = "external-frontend")]
+            "clearJellyfinSession" => Self::ClearJellyfinSession,
             _ => return None,
         })
     }
@@ -165,6 +189,18 @@ impl NativeFunction {
             Self::CsdReady => "csdReady",
             Self::MenuItemSelected => "menuItemSelected",
             Self::MenuDismissed => "menuDismissed",
+            #[cfg(feature = "external-frontend")]
+            Self::PlayJellyfinItem => "playJellyfinItem",
+            #[cfg(feature = "external-frontend")]
+            Self::RequestAuthChallenge => "requestAuthChallenge",
+            #[cfg(feature = "external-frontend")]
+            Self::CompleteAuth => "completeAuth",
+            #[cfg(feature = "external-frontend")]
+            Self::JellyfinSessionReady => "jellyfinSessionReady",
+            #[cfg(feature = "external-frontend")]
+            Self::JellyfinSessionFailed => "jellyfinSessionFailed",
+            #[cfg(feature = "external-frontend")]
+            Self::ClearJellyfinSession => "clearJellyfinSession",
         }
     }
 }
@@ -177,9 +213,12 @@ pub(crate) enum InjectedScript {
     MpvAudioPlayer,
     InputPlugin,
     ClientSettings,
+    JellyfinSession,
     Csd,
     ContextMenu,
     SelectMenu,
+    #[cfg(feature = "external-frontend")]
+    ExternalHost,
 }
 
 impl InjectedScript {
@@ -191,9 +230,12 @@ impl InjectedScript {
             "mpv-audio-player.js" => Self::MpvAudioPlayer,
             "input-plugin.js" => Self::InputPlugin,
             "client-settings.js" => Self::ClientSettings,
+            "jellyfin-session.js" => Self::JellyfinSession,
             "csd.js" => Self::Csd,
             "context-menu.js" => Self::ContextMenu,
             "select-menu.js" => Self::SelectMenu,
+            #[cfg(feature = "external-frontend")]
+            "external-host.js" => Self::ExternalHost,
             _ => return None,
         })
     }
@@ -206,9 +248,12 @@ impl InjectedScript {
             Self::MpvAudioPlayer => "mpv-audio-player.js",
             Self::InputPlugin => "input-plugin.js",
             Self::ClientSettings => "client-settings.js",
+            Self::JellyfinSession => "jellyfin-session.js",
             Self::Csd => "csd.js",
             Self::ContextMenu => "context-menu.js",
             Self::SelectMenu => "select-menu.js",
+            #[cfg(feature = "external-frontend")]
+            Self::ExternalHost => "external-host.js",
         }
     }
 
@@ -256,6 +301,10 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::ThemeColor,
     NativeFunction::SetOsdVisible,
     NativeFunction::ToggleFullscreen,
+    #[cfg(feature = "external-frontend")]
+    NativeFunction::JellyfinSessionReady,
+    #[cfg(feature = "external-frontend")]
+    NativeFunction::JellyfinSessionFailed,
 ];
 
 const WEB_SCRIPTS: &[InjectedScript] = &[
@@ -265,6 +314,8 @@ const WEB_SCRIPTS: &[InjectedScript] = &[
     InjectedScript::MpvAudioPlayer,
     InjectedScript::InputPlugin,
     InjectedScript::ClientSettings,
+    #[cfg(feature = "external-frontend")]
+    InjectedScript::JellyfinSession,
 ];
 const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::GetSavedServerUrl,
@@ -277,6 +328,20 @@ const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
 
 const ABOUT_FUNCTIONS: &[NativeFunction] =
     &[NativeFunction::AboutOpenPath, NativeFunction::AboutDismiss];
+
+#[cfg(feature = "external-frontend")]
+const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[
+    NativeFunction::PlayJellyfinItem,
+    NativeFunction::RequestAuthChallenge,
+    NativeFunction::CompleteAuth,
+    NativeFunction::ClearJellyfinSession,
+    NativeFunction::AppExit,
+    NativeFunction::WindowMinimize,
+    NativeFunction::WindowToggleMaximize,
+    NativeFunction::ToggleFullscreen,
+];
+#[cfg(feature = "external-frontend")]
+const EXTERNAL_SCRIPTS: &[InjectedScript] = &[InjectedScript::ExternalHost];
 
 const WINDOW_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::WindowMinimize,
@@ -564,6 +629,15 @@ pub(crate) fn build_for_kind(
             &[],
             add_ctx_menu,
             true,
+            shared_textures_enabled,
+            ctx_menu,
+        )),
+        #[cfg(feature = "external-frontend")]
+        "external" => Some(build_extra_info(
+            EXTERNAL_FUNCTIONS,
+            EXTERNAL_SCRIPTS,
+            false,
+            false,
             shared_textures_enabled,
             ctx_menu,
         )),

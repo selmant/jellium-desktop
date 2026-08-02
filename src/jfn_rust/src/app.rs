@@ -352,8 +352,17 @@ fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
 fn initialize_cef(ba: &BootArgs, use_shared_textures: bool) -> bool {
     jfn_cef::ffi::jfn_cef_set_log_severity(cef_severity_for_cef_filter());
     jfn_cef::ffi::jfn_cef_set_remote_debugging_port(ba.remote_debugging_port);
-    jfn_cef::ffi::jfn_cef_set_disable_gpu_compositing(!use_shared_textures);
+    // Shared textures are a zero-copy *host presentation* path. Falling back
+    // to software/GPU-upload paint must not disable Chromium's own GPU
+    // compositor — that is what accelerates CSS blur/transforms in the UI.
+    // Only honor the explicit CLI/settings opt-out.
+    jfn_cef::ffi::jfn_cef_set_disable_gpu_compositing(ba.disable_gpu_compositing);
     jfn_cef::ffi::jfn_cef_set_platform_switches(plat().display());
+    tracing::info!(
+        target: "Main",
+        "CEF init: shared_textures={use_shared_textures} disable_gpu_compositing={}",
+        ba.disable_gpu_compositing
+    );
     tracing::info!(target: "Main", "[FLOW] calling CefInitialize...");
     if !jfn_cef::ffi::jfn_cef_initialize() {
         tracing::error!(target: "Main", "CefInitialize failed");
@@ -390,6 +399,20 @@ fn start_playback_coordination() -> bool {
         tracing::info!(target: "Main", "MPV_EVENT_SHUTDOWN received");
         jfn_playback::jfn_shutdown_initiate();
     });
+
+    // First video frames can briefly size the Wayland VO to the media's native
+    // resolution; reassert the locked host geometry (immediate + short deferred)
+    // so letterboxing matches the window without needing a fullscreen toggle.
+    jfn_playback::register_event_sink(Box::new(|event| {
+        if !matches!(event.kind, jfn_playback::PlaybackEventKind::Started) {
+            return;
+        }
+        plat().mpv_host().reassert_window_size();
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            plat().mpv_host().reassert_window_size();
+        });
+    }));
 
     tracing::info!(target: "Main", "[FLOW] starting Rust-owned mpv event thread");
     if !jfn_playback::ingest_driver::jfn_playback_start_mpv_event_thread() {
@@ -491,7 +514,10 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
 fn init_main_browser(
     hz: f64,
     use_shared_textures: bool,
+    host_options: &crate::host::HostOptions,
 ) -> (std::thread::JoinHandle<()>, *mut jfn_cef::JfnCefLayer) {
+    #[cfg(not(feature = "external-frontend"))]
+    let _ = host_options;
     // Must run before main browser create: the pre-loaded page fires its
     // initial theme-color IPC at DOMContentLoaded.
     let titlebar_themed = jfn_config::titlebar_theme_color();
@@ -526,14 +552,46 @@ fn init_main_browser(
     }
     tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) call returned");
 
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
-    jfn_cef::business_overlay::jfn_overlay_init(main_layer);
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
+    // Foreseer / external hosts own discovery and auth bootstrap. The stock
+    // server-selection overlay would sit above mpv forever if never completed,
+    // so skip it entirely in that mode and unlock theme color as if dismissed.
+    #[cfg(feature = "external-frontend")]
+    let skip_server_overlay = host_options.external_frontend().is_some();
+    #[cfg(not(feature = "external-frontend"))]
+    let skip_server_overlay = false;
+    if skip_server_overlay {
+        tracing::info!(
+            target: "Main",
+            "[FLOW] skipping jfn_overlay_init (external frontend owns UI)"
+        );
+        jfn_color::theme::jfn_theme_color_on_overlay_dismissed();
+    } else {
+        tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
+        jfn_cef::business_overlay::jfn_overlay_init(main_layer);
+        tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
+    }
+
+    #[cfg(feature = "external-frontend")]
+    if let Some(frontend) = host_options.external_frontend() {
+        jfn_cef::business_external::jfn_external_init(
+            main_layer,
+            frontend.start_url(),
+            frontend.allowed_origin(),
+            host_options.auth_service(),
+        );
+    }
 
     (manager_thread, main_layer)
 }
 
 pub fn jfn_app_main() -> c_int {
+    jfn_app_main_with(crate::host::HostOptions::default())
+}
+
+/// Run the complete Jellium lifecycle with an optional external frontend.
+///
+/// This is the supported entry point for a thin downstream desktop binary.
+pub fn jfn_app_main_with(host_options: crate::host::HostOptions) -> c_int {
     crate::platform_install::install_early();
 
     let rc = jfn_cef::ffi::jfn_cef_start();
@@ -632,7 +690,7 @@ pub fn jfn_app_main() -> c_int {
         disable_gpu_compositing: opts.disable_gpu_compositing,
         remote_debugging_port: opts.remote_debugging_port,
     };
-    let rc = unsafe { run_with_cef(&boot_args) };
+    let rc = unsafe { run_with_cef(&boot_args, &host_options) };
     if rc != 0 {
         return rc;
     }
@@ -727,10 +785,12 @@ fn vo_ready(need_max: &mut bool) -> bool {
 // =====================================================================
 
 const LOG_CEF: u8 = 2;
-const LOG_SEVERITY_VERBOSE: c_int = -1;
-const LOG_SEVERITY_INFO: c_int = 0;
-const LOG_SEVERITY_WARNING: c_int = 1;
-const LOG_SEVERITY_ERROR: c_int = 2;
+// Values from cef_log_severity_t. Keep these aligned with the CEF ABI rather
+// than the historical internal logging levels used by the app.
+const LOG_SEVERITY_VERBOSE: c_int = 1;
+const LOG_SEVERITY_INFO: c_int = 2;
+const LOG_SEVERITY_WARNING: c_int = 3;
+const LOG_SEVERITY_ERROR: c_int = 4;
 
 fn cef_severity_for_cef_filter() -> c_int {
     // Map LOG_CEF level to CEF severity:
@@ -788,7 +848,7 @@ fn h_shutdown_wake_manager() {
 }
 
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
-unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
+unsafe fn run_with_cef(ba: &BootArgs, host_options: &crate::host::HostOptions) -> c_int {
     // 2. Platform init (PlatformScope). Cleanup happens in shutdown_runtime.
     let mpv_raw = jfn_mpv::boot::jfn_mpv_handle_get();
     let platform_ok = plat().init(mpv_raw as *mut std::ffi::c_void);
@@ -817,11 +877,13 @@ unsafe fn run_with_cef(ba: &BootArgs) -> c_int {
 
     let hz = boot_mpv_reconcile(mpv_raw);
 
-    let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures);
+    let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures, host_options);
 
     if !start_playback_coordination() {
         return 1;
     }
+    #[cfg(feature = "external-frontend")]
+    jfn_cef::business_external::jfn_external_start_playback_observer();
 
     // 14. Wait for the main browser to finish loading. Skipped when the
     //     platform pumps CEF itself (external pump on the main thread):

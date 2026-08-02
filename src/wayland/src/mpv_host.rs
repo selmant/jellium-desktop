@@ -32,6 +32,10 @@ impl MpvHost for WaylandMpvHost {
         crate::root_window::ensure_started();
     }
 
+    fn reassert_window_size(&self) {
+        crate::mpv_proxy::reassert_window_size();
+    }
+
     fn detach(&self) {}
 }
 

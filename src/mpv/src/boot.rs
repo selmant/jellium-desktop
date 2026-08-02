@@ -34,6 +34,28 @@ impl DisplayBackend {
     }
 }
 
+fn product_title() -> String {
+    std::env::var("JELLIUM_DESKTOP_TITLE")
+        .ok()
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .unwrap_or_else(|| "Jellium Desktop".to_owned())
+}
+
+fn product_app_id() -> String {
+    std::env::var("JELLIUM_DESKTOP_APP_ID")
+        .ok()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+        .unwrap_or_else(|| "net.nullsum.JelliumDesktop".to_owned())
+}
+
 /// Boot-time configuration handed to `jfn_mpv_handle_init`. Every
 /// option applied between `mpv_create` and `mpv_initialize` lives here.
 /// All string fields are NUL-terminated UTF-8 or
@@ -150,8 +172,16 @@ fn apply_defaults(
     // (e.g. KDE) would stack on top of ours.
     let suppress_ssd = display == DisplayBackend::Wayland && client_side_decorations;
     set("border", if suppress_ssd { "no" } else { "yes" })?;
-    set("title", "Jellium Desktop")?;
-    set("wayland-app-id", "net.nullsum.JelliumDesktop")?;
+    let product_title = product_title();
+    set("title", &product_title)?;
+    // mpv otherwise replaces the window title with the media name, which is
+    // ambiguous beside a standalone Jellyfin client. Keep the host product
+    // visible in the compositor's window list while preserving the title.
+    set(
+        "force-media-title",
+        &format!("{product_title} — ${{media-title}}"),
+    )?;
+    set("wayland-app-id", &product_app_id())?;
 
     // Keep window open when idle. `force-window=yes` (not "immediate")
     // avoids a macOS deadlock: "immediate" calls handle_force_window
