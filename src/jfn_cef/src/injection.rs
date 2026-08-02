@@ -195,6 +195,7 @@ pub(crate) enum InjectedScript {
     MpvAudioPlayer,
     InputPlugin,
     ClientSettings,
+    JellyfinSession,
     Csd,
     ContextMenu,
     SelectMenu,
@@ -211,6 +212,7 @@ impl InjectedScript {
             "mpv-audio-player.js" => Self::MpvAudioPlayer,
             "input-plugin.js" => Self::InputPlugin,
             "client-settings.js" => Self::ClientSettings,
+            "jellyfin-session.js" => Self::JellyfinSession,
             "csd.js" => Self::Csd,
             "context-menu.js" => Self::ContextMenu,
             "select-menu.js" => Self::SelectMenu,
@@ -228,6 +230,7 @@ impl InjectedScript {
             Self::MpvAudioPlayer => "mpv-audio-player.js",
             Self::InputPlugin => "input-plugin.js",
             Self::ClientSettings => "client-settings.js",
+            Self::JellyfinSession => "jellyfin-session.js",
             Self::Csd => "csd.js",
             Self::ContextMenu => "context-menu.js",
             Self::SelectMenu => "select-menu.js",
@@ -289,6 +292,7 @@ const WEB_SCRIPTS: &[InjectedScript] = &[
     InjectedScript::MpvAudioPlayer,
     InjectedScript::InputPlugin,
     InjectedScript::ClientSettings,
+    InjectedScript::JellyfinSession,
 ];
 const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::GetSavedServerUrl,
