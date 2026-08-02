@@ -115,7 +115,7 @@ fn handle_message(message: BrowserMessage) -> bool {
     if message.name() == "jellyfinSessionReady" {
         let server_id = list_string(args, 0);
         let user_id = list_string(args, 1);
-        tracing::debug!(target: "ExternalHost", "received private Jellyfin session readiness acknowledgement");
+        tracing::info!(target: "ExternalHost", "received private Jellyfin session readiness acknowledgement");
         jfn_external_on_session_ready(&server_id, &user_id);
         return true;
     }
@@ -128,7 +128,7 @@ fn handle_message(message: BrowserMessage) -> bool {
             .lock()
             .as_ref()
             .and_then(|s| s.auth_service.clone());
-        tracing::debug!(target: "ExternalHost", "auth challenge requested");
+        tracing::info!(target: "ExternalHost", "auth challenge requested");
         if let Some(challenge) = service.and_then(|s| s.request_challenge(&request_id)) {
             emit_event_with_payload(
                 "auth-challenge",
@@ -151,13 +151,13 @@ fn handle_message(message: BrowserMessage) -> bool {
             .as_ref()
             .and_then(|s| s.auth_service.clone());
         if let Some(service) = service {
-            tracing::debug!(target: "ExternalHost", "redeeming native auth ticket");
+            tracing::info!(target: "ExternalHost", "redeeming native auth ticket");
             service.complete_auth(
                 request_id.clone(),
                 ticket,
                 Box::new(move |result| match result {
                     Ok(bootstrap) => {
-                        tracing::debug!(target: "ExternalHost", "native auth redemption succeeded");
+                        tracing::info!(target: "ExternalHost", "native auth redemption succeeded");
                         install_bootstrap(&request_id, bootstrap)
                     }
                     Err(code) => {
@@ -180,7 +180,7 @@ fn handle_message(message: BrowserMessage) -> bool {
         state.active_request_id = Some(request_id.clone());
     }
     crate::business_web::jfn_web_play_item(&item_id);
-    tracing::debug!(target: "ExternalHost", "Jellyfin item play request accepted");
+    tracing::info!(target: "ExternalHost", "Jellyfin item play request accepted");
     true
 }
 
@@ -275,7 +275,7 @@ fn install_bootstrap(request_id: &str, bootstrap: JellyfinSessionBootstrap) {
             user_id: bootstrap.user_id,
         });
     }
-    tracing::debug!(target: "ExternalHost", "bootstrap installed into private Jellyfin layer; waiting for readiness acknowledgement");
+    tracing::info!(target: "ExternalHost", "bootstrap installed into private Jellyfin layer; waiting for readiness acknowledgement");
 }
 
 /// Complete the auth exchange only after the private Jellyfin Web layer has
@@ -299,7 +299,7 @@ pub fn jfn_external_on_session_ready(server_id: &str, user_id: &str) {
             .map(|pending| pending.request_id)
     };
     if let Some(request_id) = request_id {
-        tracing::debug!(target: "ExternalHost", "private Jellyfin session is ready");
+        tracing::info!(target: "ExternalHost", "private Jellyfin session is ready");
         emit_event("ready", &request_id);
     }
 }
