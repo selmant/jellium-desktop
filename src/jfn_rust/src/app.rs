@@ -747,10 +747,12 @@ fn vo_ready(need_max: &mut bool) -> bool {
 // =====================================================================
 
 const LOG_CEF: u8 = 2;
-const LOG_SEVERITY_VERBOSE: c_int = -1;
-const LOG_SEVERITY_INFO: c_int = 0;
-const LOG_SEVERITY_WARNING: c_int = 1;
-const LOG_SEVERITY_ERROR: c_int = 2;
+// Values from cef_log_severity_t. Keep these aligned with the CEF ABI rather
+// than the historical internal logging levels used by the app.
+const LOG_SEVERITY_VERBOSE: c_int = 1;
+const LOG_SEVERITY_INFO: c_int = 2;
+const LOG_SEVERITY_WARNING: c_int = 3;
+const LOG_SEVERITY_ERROR: c_int = 4;
 
 fn cef_severity_for_cef_filter() -> c_int {
     // Map LOG_CEF level to CEF severity:
