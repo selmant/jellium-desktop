@@ -80,6 +80,30 @@ pub(super) fn post_paste_js(inner: Arc<Inner>, text: String) {
     let _ = post_task(ThreadId::UI, Some(&mut task));
 }
 
+wrap_task! {
+    struct ZoomTask {
+        inner: Arc<Inner>,
+        command: cef::ZoomCommand,
+    }
+    impl Task {
+        fn execute(&self) {
+            let Some(host) = self.inner.host() else {
+                return;
+            };
+            use cef::ImplBrowserHost;
+            if host.can_zoom(self.command) != 0 {
+                host.zoom(self.command);
+            }
+        }
+    }
+}
+
+/// `BrowserHost::zoom` is UI-thread-only. Wheel input arrives off TID_UI.
+pub(super) fn post_zoom(inner: Arc<Inner>, command: cef::ZoomCommand) {
+    let mut task = ZoomTask::new(inner, command);
+    let _ = post_task(ThreadId::UI, Some(&mut task));
+}
+
 type CloseCollectTx = Arc<Mutex<Option<SyncSender<Vec<Arc<Inner>>>>>>;
 
 wrap_task! {

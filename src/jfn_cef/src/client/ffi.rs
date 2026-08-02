@@ -204,11 +204,67 @@ pub(crate) unsafe fn jfn_cef_layer_send_mouse_wheel(
     dx: c_int,
     dy: c_int,
 ) {
-    let Some(host) = unsafe { arc(h) }.host() else {
+    let layer = unsafe { arc(h) };
+
+    // Ctrl/Cmd + wheel → page zoom. Must post to TID_UI: BrowserHost::zoom
+    // is UI-thread-only (unlike send_mouse_wheel_event, which CEF marshals).
+    if zoom_from_wheel(Arc::clone(&layer), modifiers, dy) {
+        return;
+    }
+
+    let Some(host) = layer.host() else {
         return;
     };
     let me = MouseEvent { x, y, modifiers };
     host.send_mouse_wheel_event(Some(&me), dx, dy);
+}
+
+fn zoom_from_wheel(inner: Arc<Inner>, modifiers: u32, dy: c_int) -> bool {
+    use cef::ZoomCommand;
+    use jfn_platform_abi::event_flags::{
+        EVENTFLAG_ALT_DOWN, EVENTFLAG_CONTROL_DOWN, EVENTFLAG_PRECISION_SCROLLING_DELTA,
+    };
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static PRECISE_ACCUM: AtomicI32 = AtomicI32::new(0);
+
+    let action = jfn_platform_abi::try_get()
+        .map(|p| p.display().action_modifier_flag())
+        .unwrap_or(EVENTFLAG_CONTROL_DOWN);
+    if (modifiers & action) == 0 || (modifiers & EVENTFLAG_ALT_DOWN) != 0 {
+        PRECISE_ACCUM.store(0, Ordering::Relaxed);
+        return false;
+    }
+    if dy == 0 {
+        return true;
+    }
+
+    let precise = (modifiers & EVENTFLAG_PRECISION_SCROLLING_DELTA) != 0;
+    if precise {
+        const THRESHOLD: i32 = 80;
+        let mut accum = PRECISE_ACCUM.load(Ordering::Relaxed) + dy;
+        while accum >= THRESHOLD {
+            super::tasks::post_zoom(Arc::clone(&inner), ZoomCommand::IN);
+            accum -= THRESHOLD;
+        }
+        while accum <= -THRESHOLD {
+            super::tasks::post_zoom(Arc::clone(&inner), ZoomCommand::OUT);
+            accum += THRESHOLD;
+        }
+        PRECISE_ACCUM.store(accum, Ordering::Relaxed);
+    } else {
+        PRECISE_ACCUM.store(0, Ordering::Relaxed);
+        // Wayland v120 notches are typically ±120 after sign flip.
+        super::tasks::post_zoom(
+            inner,
+            if dy > 0 {
+                ZoomCommand::IN
+            } else {
+                ZoomCommand::OUT
+            },
+        );
+    }
+    true
 }
 
 pub(crate) unsafe fn jfn_cef_layer_set_surface(h: *const JfnCefLayer, s: *mut c_void) {
