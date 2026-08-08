@@ -12,35 +12,28 @@ use std::num::NonZeroU32;
 
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
-use smithay_client_toolkit::{delegate_output, delegate_registry, registry_handlers};
+use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_output;
 use wayland_client::{Connection, QueueHandle};
 
 use crate::scale::Scale120;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ScaleProbeError {
     /// No `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` in the environment.
+    #[error("no Wayland session")]
     NoWaylandSession,
     /// Connecting or round-tripping on the probe connection failed.
+    #[error("probe connection failed")]
     Connection,
     /// No output offered complete, positive geometry to derive a scale from.
+    #[error("no usable output")]
     NoUsableOutput,
     /// The probe thread outlived its deadline (the compositor stalled the
     /// probe connection's round trips).
+    #[error("probe timed out")]
     Timeout,
-}
-
-impl std::fmt::Display for ScaleProbeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoWaylandSession => write!(f, "no Wayland session"),
-            Self::Connection => write!(f, "probe connection failed"),
-            Self::NoUsableOutput => write!(f, "no usable output"),
-            Self::Timeout => write!(f, "probe timed out"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +134,7 @@ impl ProvidesRegistryState for State {
     registry_handlers![OutputState];
 }
 
-delegate_output!(State);
+delegate_dispatch2!(State);
 delegate_registry!(State);
 
 fn transform_swaps_axes(t: wl_output::Transform) -> bool {
@@ -218,7 +211,7 @@ pub(crate) fn probe_scale_bounded(
     target: ProbeTarget,
     timeout: std::time::Duration,
 ) -> Result<Scale120, ScaleProbeError> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::bounded::<Result<Scale120, ScaleProbeError>>(1);
     std::thread::Builder::new()
         .name("wl-scale-probe".into())
         .spawn(move || {

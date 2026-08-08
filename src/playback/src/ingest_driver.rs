@@ -4,10 +4,10 @@
 //! shutdown) that don't flow through the coordinator queue.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use jfn_mpv::{Event, PropertyValue, sys as mpv_sys};
+use crossbeam_channel::Receiver;
+use jfn_mpv::{Event, PropertyValue};
 
 use crate::ffi::post as post_input;
 use crate::ingest::{
@@ -41,11 +41,6 @@ impl IngestCtx for CallerCtx {
     }
 }
 
-fn shutdown_flag() -> &'static AtomicBool {
-    static FLAG: AtomicBool = AtomicBool::new(false);
-    &FLAG
-}
-
 // ---------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------
@@ -56,10 +51,7 @@ fn dispatch(outs: Vec<IngestOut>) -> u8 {
         match o {
             IngestOut::Input(i) => post_input(i),
             IngestOut::WindowExtentChanged => jfn_platform_abi::notify_window_changed(),
-            IngestOut::Shutdown => {
-                shutdown_flag().store(true, Ordering::Release);
-                flags |= INGEST_FLAG_SHUTDOWN;
-            }
+            IngestOut::Shutdown => flags |= INGEST_FLAG_SHUTDOWN,
         }
     }
     flags
@@ -73,6 +65,13 @@ fn dispatch(outs: Vec<IngestOut>) -> u8 {
 /// the most recent osd-dimensions digest.
 pub fn jfn_playback_window_extent() -> Option<jfn_platform_abi::WindowExtent> {
     state().window_extent()
+}
+
+/// mpv's native window handle (`window-id`) as last observed. `None` before
+/// mpv's VO has created its window, and on backends where mpv embeds into a
+/// host window.
+pub fn jfn_playback_window_id() -> Option<i64> {
+    state().window_id()
 }
 
 /// Returns flag bits — see [`INGEST_FLAG_SHUTDOWN`].
@@ -150,14 +149,16 @@ pub fn jfn_playback_set_display_hz(hz: f64) {
 /// Display-backend discriminant.
 ///   0 = Wayland, 1 = X11, 2 = Other (macOS/Windows)
 pub const BACKEND_WAYLAND: u8 = 0;
+pub const BACKEND_X11: u8 = 1;
 
 /// Register the property observations whose IDs are dispatched by the
 /// ingest layer. Backend selection skips `osd-dimensions`, `fullscreen`,
-/// and `window-maximized` on Wayland — the compositor owns the toplevel
-/// there, so the window's `xdg_toplevel.configure` feeds dims and mode via
-/// [`jfn_playback_post_osd_pixels`] / [`jfn_playback_post_window_state`]
-/// instead, and mpv's own properties either never change (mode) or would
-/// double-post identical values (dims).
+/// and `window-maximized` on Wayland and X11 — the app owns the toplevel
+/// there, so the host window feeds dims and mode through the native
+/// [`jfn_platform_abi::WindowSource`] (via `notify_window_changed` →
+/// `jfn_playback_reconcile_window_mode`) instead, and mpv's own properties
+/// either never change (mode) or describe an embedded child, not the
+/// window.
 ///
 /// Requires `jfn_mpv_handle_init` to have succeeded; returns false if
 /// the handle is missing.
@@ -171,8 +172,11 @@ pub fn jfn_playback_observe_mpv_properties(backend: u8) -> bool {
 
     // Order matches the legacy C++ observe_properties(): display-hidpi-scale
     // is registered before osd-dimensions so mpv's FIFO initial-value
-    // delivery seeds the scale before osd-dimensions consumes it.
+    // delivery seeds the scale before osd-dimensions consumes it. window-id
+    // precedes both so the platform's window handle resolves before the first
+    // digest asks the platform for scale.
     let pairs: &[(u64, &std::ffi::CStr, mpv_format)] = &[
+        (WINDOW_ID, c"window-id", mpv_format::MPV_FORMAT_INT64),
         (
             DISPLAY_SCALE,
             c"display-hidpi-scale",
@@ -206,7 +210,9 @@ pub fn jfn_playback_observe_mpv_properties(backend: u8) -> bool {
     ];
 
     for &(id, name, fmt) in pairs {
-        if backend == BACKEND_WAYLAND && matches!(id, OSD_DIMS | FULLSCREEN | WINDOW_MAX) {
+        if matches!(backend, BACKEND_WAYLAND | BACKEND_X11)
+            && matches!(id, OSD_DIMS | FULLSCREEN | WINDOW_MAX | WINDOW_ID)
+        {
             continue;
         }
         unsafe { jfn_mpv::sys::mpv_observe_property(raw, id, name.as_ptr(), fmt) };
@@ -267,7 +273,7 @@ fn shutdown_handler_slot() -> &'static parking_lot::Mutex<Option<ShutdownHandler
 }
 
 struct EventThread {
-    stop: std::sync::Arc<AtomicBool>,
+    events: jfn_mpv::EventLoop,
     join: Option<JoinHandle<()>>,
 }
 
@@ -328,82 +334,67 @@ fn invoke_shutdown_handler() {
     }
 }
 
-/// Spawn the Rust-owned mpv event thread. The thread blocks in
-/// `mpv_wait_event(-1)` on the handle returned by
-/// `jfn_mpv::boot::current_raw_handle()`, decodes each event into
-/// `jfn_mpv::Event`, and routes through the same ingest path that
-/// [`jfn_playback_ingest_mpv_event`] uses. Returns `false` if the
-/// handle is not yet initialized or the thread is already running.
+/// Spawn the [`jfn_mpv::EventLoop`] drain thread plus the ingest
+/// consumer thread that reads its receiver and routes each event through
+/// the same path [`jfn_playback_ingest_mpv_event_owned`] uses. Returns
+/// `false` if the handle is not yet initialized or the threads are
+/// already running.
 pub fn jfn_playback_start_mpv_event_thread() -> bool {
     let mut guard = event_thread_slot().lock();
     if guard.is_some() {
         return false;
     }
-    let Some(raw) = jfn_mpv::boot::current_raw_handle() else {
+    let Some(handle) = jfn_mpv::boot::current_handle() else {
         return false;
     };
-    let raw_addr = raw as usize;
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let stop_thread = std::sync::Arc::clone(&stop);
+    let (events, rx) = match jfn_mpv::EventLoop::spawn(handle) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("[playback] failed to spawn mpv event loop: {e}");
+            return false;
+        }
+    };
     let join = match thread::Builder::new()
-        .name("jfn-mpv-events".into())
-        .spawn(move || event_loop(raw_addr, stop_thread))
+        .name("jfn-mpv-ingest".into())
+        .spawn(move || ingest_events(rx))
     {
         Ok(join) => join,
         Err(e) => {
-            eprintln!("[playback] failed to spawn jfn-mpv-events thread: {e}");
+            eprintln!("[playback] failed to spawn jfn-mpv-ingest thread: {e}");
             return false;
         }
     };
     *guard = Some(EventThread {
-        stop,
+        events,
         join: Some(join),
     });
     true
 }
 
-/// Stop the Rust-owned mpv event thread and join it. Idempotent.
-/// `mpv_wakeup` is called on the live handle so the in-flight
-/// `mpv_wait_event` returns immediately.
+/// Stop the drain loop, then join the ingest thread. Idempotent.
 pub fn jfn_playback_stop_mpv_event_thread() {
     let entry = event_thread_slot().lock().take();
     let Some(mut t) = entry else { return };
-    t.stop.store(true, Ordering::Release);
-    jfn_mpv::boot::wakeup_current();
+    t.events.stop();
     if let Some(join) = t.join.take() {
         let _ = join.join();
     }
 }
 
-fn event_loop(handle_addr: usize, stop: std::sync::Arc<AtomicBool>) {
-    let handle = handle_addr as *mut mpv_sys::mpv_handle;
-    loop {
-        if stop.load(Ordering::Acquire) {
-            return;
+fn ingest_events(rx: Receiver<Event>) {
+    for event in rx {
+        if let Event::PropertyChange { id, ref value, .. } = event
+            && id == crate::ingest::observe_id::FULLSCREEN
+            && let PropertyValue::Flag(f) = value
+        {
+            invoke_fullscreen_handler(*f);
         }
-        let ev_ptr = unsafe { mpv_sys::mpv_wait_event(handle, -1.0) };
-        let event = unsafe { Event::from_raw(ev_ptr) };
-        match event {
-            Event::None => continue,
-            Event::LogMessage(ref m) => {
-                jfn_mpv::forward_log_to_tracing(m);
-                continue;
-            }
-            Event::PropertyChange { id, ref value, .. } => {
-                if id == crate::ingest::observe_id::FULLSCREEN
-                    && let PropertyValue::Flag(f) = value
-                {
-                    invoke_fullscreen_handler(*f);
-                }
-            }
-            _ => {}
-        }
-        let scale = snapshot_scale();
-        let mac = snapshot_macos_logical();
-        let ctx = CallerCtx { scale, mac };
+        let ctx = CallerCtx {
+            scale: snapshot_scale(),
+            mac: snapshot_macos_logical(),
+        };
         let outs = ingest_event_for_ffi(&event, state(), &ctx);
-        let flags = dispatch(outs);
-        if flags & INGEST_FLAG_SHUTDOWN != 0 {
+        if dispatch(outs) & INGEST_FLAG_SHUTDOWN != 0 {
             invoke_shutdown_handler();
             return;
         }

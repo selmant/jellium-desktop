@@ -3,11 +3,20 @@
 #![cfg(target_os = "macos")]
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_int, c_void};
 use std::sync::atomic::Ordering;
 
+use objc2::MainThreadMarker;
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString, NSScreen, NSWorkspace};
+use objc2_core_foundation::{CFRunLoop, CFString, kCFRunLoopDefaultMode};
+use objc2_foundation::{NSDefaultRunLoopMode, NSString, NSURL};
+use objc2_io_kit::{
+    IOPMAssertionCreateWithName, IOPMAssertionID, IOPMAssertionRelease, kIOPMAssertionLevelOn,
+    kIOReturnSuccess,
+};
+
 use jfn_platform_abi::geometry::{Bounds, clamp_to_bounds};
-pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform, WindowDecorations};
+pub use jfn_platform_abi::{DisplayBackend, JfnRect, PaintFrame, Platform, WindowDecorations};
 
 // =====================================================================
 // Backend no-op entry points.
@@ -27,51 +36,15 @@ pub fn macos_end_transition() {
 
 // jfn_macos_get_window + jfn_macos_apply_theme_color_on_main are now
 // Rust-side (see src/macos/src/init.rs).
+use crate::dispatch::{post_to_main, run_on_main_async, wake_main_queue};
 use crate::init::{jfn_macos_apply_theme_color_on_main, jfn_macos_get_window};
-
-unsafe extern "C" {
-    // dispatch_get_main_queue() is an inline C function that returns
-    // &_dispatch_main_q, so the exported symbol is the queue object itself.
-    static _dispatch_main_q: c_void;
-    fn dispatch_async_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-#[inline]
-fn dispatch_get_main_queue() -> *mut c_void {
-    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
-}
-
-/// Returns true if the current thread is the AppKit main thread. Avoids
-/// pulling in `objc2-foundation` `MainThreadMarker` infrastructure for a
-/// single check.
-fn is_main_thread() -> bool {
-    unsafe {
-        let cls = objc2::class!(NSThread);
-        let b: bool = objc2::msg_send![cls, isMainThread];
-        b
-    }
-}
-
-unsafe extern "C" fn theme_color_trampoline(ctx: *mut c_void) {
-    let rgb = ctx as usize as u32;
-    jfn_macos_apply_theme_color_on_main(rgb);
-}
 
 /// Tint AppKit fills behind mpv's CAMetalLayer / NSWindow root so the
 /// resize-gap stale-texture window (which CLAUDE.md explicitly accepts
 /// over stretching) matches mpv's own background — no visible flash.
 /// Hops to the main queue when called from another thread.
 pub fn macos_set_theme_color(rgb: u32) {
-    if is_main_thread() {
-        jfn_macos_apply_theme_color_on_main(rgb);
-    } else {
-        let ctx = rgb as usize as *mut c_void;
-        unsafe { dispatch_async_f(dispatch_get_main_queue(), ctx, theme_color_trampoline) };
-    }
+    run_on_main_async(move || jfn_macos_apply_theme_color_on_main(rgb));
 }
 
 // =====================================================================
@@ -79,41 +52,7 @@ pub fn macos_set_theme_color(rgb: u32) {
 // releases it. Levels: 0=None, 1=System, 2=Display.
 // =====================================================================
 
-#[allow(non_camel_case_types)]
-type IOPMAssertionID = u32;
-#[allow(non_camel_case_types)]
-type IOPMAssertionLevel = u32;
-type IOReturn = i32;
-
 const K_IOPM_NULL_ASSERTION_ID: IOPMAssertionID = 0;
-const K_IOPM_ASSERTION_LEVEL_ON: IOPMAssertionLevel = 255;
-
-// CFStringRef is an opaque pointer.
-type CFStringRef = *const c_void;
-
-unsafe extern "C" {
-    fn IOPMAssertionCreateWithName(
-        assertion_type: CFStringRef,
-        assertion_level: IOPMAssertionLevel,
-        assertion_name: CFStringRef,
-        assertion_id: *mut IOPMAssertionID,
-    ) -> IOReturn;
-    fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> IOReturn;
-
-    fn CFStringCreateWithCStringNoCopy(
-        alloc: *const c_void,
-        c_str: *const c_char,
-        encoding: u32,
-        contents_deallocator: *const c_void,
-    ) -> CFStringRef;
-
-    // kCFAllocatorNull as contents_deallocator: CF won't free our static byte buffers.
-    static kCFAllocatorNull: *const c_void;
-
-    fn CFRelease(cf: *const c_void);
-}
-
-const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 static G_IDLE_ASSERTION: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(K_IOPM_NULL_ASSERTION_ID);
@@ -123,52 +62,29 @@ pub fn macos_set_idle_inhibit(level: c_int) {
     // call, not just level == None).
     let prev = G_IDLE_ASSERTION.swap(K_IOPM_NULL_ASSERTION_ID, Ordering::SeqCst);
     if prev != K_IOPM_NULL_ASSERTION_ID {
-        unsafe { IOPMAssertionRelease(prev) };
+        let _ = IOPMAssertionRelease(prev);
     }
 
-    // Levels: None=0, System=1, Display=2.
-    // kIOPMAssertionTypePrevent* are CFSTR() macros — no linker symbols;
-    // build equivalent CFStrings via NoCopy using static byte strings.
-    let type_cstr: &std::ffi::CStr = match level {
-        2 => c"PreventUserIdleDisplaySleep",
-        1 => c"PreventUserIdleSystemSleep",
+    // Levels: None=0, System=1, Display=2. kIOPMAssertionTypePrevent* are
+    // CFSTR() macros with no linker symbol, so build the CFStrings here.
+    let assertion_type = match level {
+        2 => CFString::from_str("PreventUserIdleDisplaySleep"),
+        1 => CFString::from_str("PreventUserIdleSystemSleep"),
         _ => return,
     };
-    let assertion_type = unsafe {
-        CFStringCreateWithCStringNoCopy(
-            std::ptr::null(),
-            type_cstr.as_ptr(),
-            K_CF_STRING_ENCODING_UTF8,
-            kCFAllocatorNull,
-        )
-    };
-    if assertion_type.is_null() {
-        return;
-    }
-
-    // Build a CFString for the assertion name.
-    let name_bytes = b"Jellium Desktop media playback\0";
-    let name = unsafe {
-        CFStringCreateWithCStringNoCopy(
-            std::ptr::null(),
-            name_bytes.as_ptr() as *const c_char,
-            K_CF_STRING_ENCODING_UTF8,
-            kCFAllocatorNull,
-        )
-    };
-    if name.is_null() {
-        unsafe { CFRelease(assertion_type) };
-        return;
-    }
+    let name = CFString::from_str("Jellium Desktop media playback");
 
     let mut id: IOPMAssertionID = K_IOPM_NULL_ASSERTION_ID;
+    // SAFETY: both strings are live for the call and `id` is a valid slot.
     let rc = unsafe {
-        IOPMAssertionCreateWithName(assertion_type, K_IOPM_ASSERTION_LEVEL_ON, name, &mut id)
+        IOPMAssertionCreateWithName(
+            Some(&assertion_type),
+            kIOPMAssertionLevelOn,
+            Some(&name),
+            &mut id,
+        )
     };
-    // Release our references; IOPM retains its own copies.
-    unsafe { CFRelease(name) };
-    unsafe { CFRelease(assertion_type) };
-    if rc == 0 && id != K_IOPM_NULL_ASSERTION_ID {
+    if rc == kIOReturnSuccess && id != K_IOPM_NULL_ASSERTION_ID {
         G_IDLE_ASSERTION.store(id, Ordering::SeqCst);
     }
 }
@@ -188,13 +104,12 @@ pub fn macos_get_scale() -> f32 {
             let scale: f64 = objc2::msg_send![win, backingScaleFactor];
             return scale as f32;
         }
-        let screen: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![objc2::class!(NSScreen), mainScreen];
-        if !screen.is_null() {
-            let scale: f64 = objc2::msg_send![screen, backingScaleFactor];
-            return scale as f32;
+        // SAFETY: this entry point runs on the AppKit main thread.
+        let mtm = MainThreadMarker::new_unchecked();
+        match NSScreen::mainScreen(mtm) {
+            Some(screen) => screen.backingScaleFactor() as f32,
+            None => 1.0,
         }
-        1.0
     }
 }
 
@@ -232,7 +147,6 @@ pub fn macos_query_window_position(x: &mut c_int, y: &mut c_int) -> bool {
 
 pub fn macos_begin_transition() {
     compositor::gate_begin();
-    compositor::drop_input_textures();
 }
 
 pub fn macos_in_transition() -> bool {
@@ -244,14 +158,11 @@ pub fn macos_in_transition() -> bool {
 /// can't be unambiguously mapped to an `NSScreen` without identity
 /// persistence.
 pub fn macos_get_display_scale(_x: c_int, _y: c_int) -> f32 {
-    unsafe {
-        let screen: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![objc2::class!(NSScreen), mainScreen];
-        if screen.is_null() {
-            return 1.0;
-        }
-        let scale: f64 = objc2::msg_send![screen, backingScaleFactor];
-        scale as f32
+    // SAFETY: this entry point runs on the AppKit main thread.
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    match NSScreen::mainScreen(mtm) {
+        Some(screen) => screen.backingScaleFactor() as f32,
+        None => 1.0,
     }
 }
 
@@ -259,37 +170,22 @@ pub fn macos_get_display_scale(_x: c_int, _y: c_int) -> f32 {
 /// relative to the main screen's visible frame — so the window stays
 /// fully on-screen. Centers any unset axis (negative input).
 pub fn macos_clamp_window_geometry(w: &mut c_int, h: &mut c_int, x: &mut c_int, y: &mut c_int) {
-    unsafe {
-        let screen: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![objc2::class!(NSScreen), mainScreen];
-        if screen.is_null() {
-            return;
-        }
-        let visible: objc2_foundation::NSRect = objc2::msg_send![screen, visibleFrame];
-        let scale: f64 = objc2::msg_send![screen, backingScaleFactor];
-        let vw = (visible.size.width * scale) as c_int;
-        let vh = (visible.size.height * scale) as c_int;
-        let mut g = WindowGeometry::from_raw(*w, *h, *x, *y);
-        clamp_to_bounds(&mut g, Bounds { w: vw, h: vh });
-        *w = g.w;
-        *h = g.h;
-        let (nx, ny) = g.raw_position();
-        *x = nx;
-        *y = ny;
-    }
-}
-
-pub fn macos_surface_present_software(
-    _s: *mut c_void,
-    _dirty: *const JfnRect,
-    _dirty_len: usize,
-    _buffer: *const c_void,
-    _w: c_int,
-    _h: c_int,
-) -> bool {
-    // CEF on macOS runs hardware-accelerated (shared_texture_supported=
-    // true); the software path is not exercised. Kept for API completeness.
-    false
+    // SAFETY: this entry point runs on the AppKit main thread.
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let Some(screen) = NSScreen::mainScreen(mtm) else {
+        return;
+    };
+    let visible = screen.visibleFrame();
+    let scale = screen.backingScaleFactor();
+    let vw = (visible.size.width * scale) as c_int;
+    let vh = (visible.size.height * scale) as c_int;
+    let mut g = WindowGeometry::from_raw(*w, *h, *x, *y);
+    clamp_to_bounds(&mut g, Bounds { w: vw, h: vh });
+    *w = g.w;
+    *h = g.h;
+    let (nx, ny) = g.raw_position();
+    *x = nx;
+    *y = ny;
 }
 
 // macos_early_init / macos_init / macos_cleanup + jfn_macos_get_input_view
@@ -326,17 +222,6 @@ pub fn macos_toggle_fullscreen() {
 // Message pump / NSApplication run loop / wake.
 // =====================================================================
 
-type CFRunLoopRef = *mut c_void;
-
-unsafe extern "C" {
-    fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: i32)
-    -> i32;
-    fn CFRunLoopGetMain() -> CFRunLoopRef;
-    fn CFRunLoopWakeUp(rl: CFRunLoopRef);
-    static kCFRunLoopDefaultMode: CFStringRef;
-    static NSDefaultRunLoopMode: *mut objc2::runtime::AnyObject;
-}
-
 /// NSEventMask is NSUInteger; NSEventMaskAny is the bit-or of all event
 /// types. The canonical macro expands to `NSUIntegerMax` (all bits set).
 const NS_EVENT_MASK_ANY: u64 = u64::MAX;
@@ -369,7 +254,7 @@ pub fn macos_pump() {
             }
             let _: () = objc2::msg_send![app, sendEvent: event];
         }
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 0);
+        let _ = CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.0, false);
         let _: () = objc2::msg_send![pool, drain];
     }
 }
@@ -390,8 +275,6 @@ pub fn macos_run_main_loop() {
     }
 }
 
-unsafe extern "C" fn noop_dispatch(_ctx: *mut c_void) {}
-
 /// Wakeup hook to install with `mpv_set_wakeup_callback`. Bridges mpv's
 /// foreign-thread wakeup notification into a dispatch on the main queue,
 /// which causes `CFRunLoopRunInMode(default, _, returnAfterSourceHandled=1)`
@@ -404,13 +287,7 @@ unsafe extern "C" fn noop_dispatch(_ctx: *mut c_void) {}
 /// Called by mpv from an arbitrary thread; `_data` is unused, so any value
 /// (including null) is fine.
 pub unsafe extern "C" fn macos_mpv_wakeup_cb(_data: *mut c_void) {
-    unsafe {
-        dispatch_async_f(
-            dispatch_get_main_queue(),
-            std::ptr::null_mut(),
-            noop_dispatch,
-        )
-    };
+    wake_main_queue();
 }
 
 /// Pump pending NSEvents (non-blocking), then block on `CFRunLoopRunInMode`
@@ -420,12 +297,16 @@ pub unsafe extern "C" fn macos_mpv_wakeup_cb(_data: *mut c_void) {
 /// as soon as the run loop services one source. Used by the VO-wait loop.
 pub fn macos_pump_block(seconds: f64) {
     macos_pump();
-    unsafe {
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, 1);
-    }
+    // SAFETY: reading the framework's run-loop mode constant.
+    let _ = CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, seconds, true);
 }
 
-unsafe extern "C" fn wake_trampoline(_ctx: *mut c_void) {
+/// `-stop:` the shared application plus a sentinel applicationDefined NSEvent
+/// so the run loop wakes and exits on its next iteration.
+///
+/// # Safety
+/// Must run on the AppKit main thread.
+unsafe fn stop_app_with_sentinel() {
     unsafe {
         let pool: *mut objc2::runtime::AnyObject =
             objc2::msg_send![objc2::class!(NSAutoreleasePool), new];
@@ -457,21 +338,16 @@ unsafe extern "C" fn wake_trampoline(_ctx: *mut c_void) {
     }
 }
 
-/// Stop the NSApplication run loop from any thread. Hops to main via
-/// `dispatch_async_f` and from there calls `-stop:` plus a sentinel
-/// NSEvent so the loop wakes and exits on its next iteration. The
-/// trampoline carries no state — wake is fire-and-forget.
+/// Stop the NSApplication run loop from any thread. Posts the stop to the
+/// main queue — never inline, so the calling frame unwinds first — and wakes
+/// the run loop. Fire-and-forget.
 pub fn macos_wake_main_loop() {
-    unsafe {
-        dispatch_async_f(
-            dispatch_get_main_queue(),
-            std::ptr::null_mut(),
-            wake_trampoline,
-        );
-        // Belt-and-suspenders: also wake the main CFRunLoop directly in
-        // case the main thread is currently in CFRunLoopRunInMode rather
-        // than [NSApp run]. Harmless when [NSApp run] is active.
-        CFRunLoopWakeUp(CFRunLoopGetMain());
+    post_to_main(|| unsafe { stop_app_with_sentinel() });
+    // Belt-and-suspenders: also wake the main CFRunLoop directly in case the
+    // main thread is currently in CFRunLoopRunInMode rather than [NSApp run].
+    // Harmless when [NSApp run] is active.
+    if let Some(rl) = CFRunLoop::main() {
+        rl.wake_up();
     }
 }
 
@@ -487,10 +363,13 @@ pub fn macos_run_blocking(f: Box<dyn FnOnce() + Send>) {
         let _ = unsafe { signal(Signal::SIGALRM, SigHandler::Handler(sigalrm_noop)) };
         f();
         d2.store(true, Ordering::Release);
-        unsafe { CFRunLoopWakeUp(CFRunLoopGetMain()) };
+        if let Some(rl) = CFRunLoop::main() {
+            rl.wake_up();
+        }
     });
     while !done.load(Ordering::Acquire) {
-        unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, f64::MAX, 1) };
+        // SAFETY: reading the framework's run-loop mode constant.
+        let _ = CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, f64::MAX, true);
     }
     let _ = t.join();
 }
@@ -502,42 +381,13 @@ pub fn macos_run_blocking(f: Box<dyn FnOnce() + Send>) {
 // =====================================================================
 
 pub fn macos_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
-    // NSPasteboardTypeString is the canonical string UTI ("public.utf8-plain-text").
-    let utf8_bytes = unsafe {
-        let pb: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![objc2::class!(NSPasteboard), generalPasteboard];
-        if pb.is_null() {
-            None
-        } else {
-            // Pass the type as an NSString literal.
-            let type_cstr = c"public.utf8-plain-text";
-            let ns_type: *mut objc2::runtime::AnyObject = objc2::msg_send![
-                objc2::class!(NSString),
-                stringWithUTF8String: type_cstr.as_ptr()
-            ];
-            let ns: *mut objc2::runtime::AnyObject = objc2::msg_send![pb, stringForType: ns_type];
-            if ns.is_null() {
-                None
-            } else {
-                let utf8: *const c_char = objc2::msg_send![ns, UTF8String];
-                if utf8.is_null() {
-                    None
-                } else {
-                    let len = std::ffi::CStr::from_ptr(utf8).to_bytes().len();
-                    // Copy out before NSString is potentially released by the autorelease pool.
-                    let mut v = Vec::with_capacity(len);
-                    v.extend_from_slice(std::slice::from_raw_parts(utf8 as *const u8, len));
-                    Some(v)
-                }
-            }
-        }
-    };
-
-    let text = match &utf8_bytes {
-        Some(v) => std::str::from_utf8(v).unwrap_or(""),
-        None => "",
-    };
-    on_done(text);
+    let pb = NSPasteboard::generalPasteboard();
+    // SAFETY: reading the framework's pasteboard-type constant.
+    let text = pb
+        .stringForType(unsafe { NSPasteboardTypeString })
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    on_done(&text);
 }
 
 /// Open an external URL via NSWorkspace.
@@ -545,36 +395,10 @@ pub fn macos_open_external_url(url: &str) {
     if url.is_empty() {
         return;
     }
-    unsafe {
-        // Build an NSString from the borrowed UTF-8 bytes (NSString copies).
-        let bytes = url.as_bytes();
-        let ns_str: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![objc2::class!(NSString), alloc];
-        let ns_str: *mut objc2::runtime::AnyObject = objc2::msg_send![
-            ns_str,
-            initWithBytes: bytes.as_ptr() as *const c_void,
-            length: bytes.len(),
-            encoding: 4u64 // NSUTF8StringEncoding
-        ];
-        if ns_str.is_null() {
-            return;
-        }
-        let nsurl: *mut objc2::runtime::AnyObject = objc2::msg_send![
-            objc2::class!(NSURL),
-            URLWithString: ns_str
-        ];
-        // Balance the alloc/init retain.
-        let _: () = objc2::msg_send![ns_str, release];
-        if nsurl.is_null() {
-            return;
-        }
-        let ws: *mut objc2::runtime::AnyObject =
-            objc2::msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
-        if ws.is_null() {
-            return;
-        }
-        let _: bool = objc2::msg_send![ws, openURL: nsurl];
-    }
+    let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) else {
+        return;
+    };
+    let _ = NSWorkspace::sharedWorkspace().openURL(&nsurl);
 }
 
 // =====================================================================
@@ -593,28 +417,31 @@ pub fn macos_open_external_url(url: &str) {
 mod cef_host;
 mod cef_pump;
 mod compositor;
-mod context_menu;
-mod dropdown;
+mod dispatch;
 mod init;
 mod input;
+mod menu;
 mod mpv_host;
 mod ns_menu;
 use compositor::{
     macos_alloc_surface, macos_free_surface, macos_restack, macos_set_expected_size,
-    macos_surface_present, macos_surface_resize, macos_surface_set_visible,
+    macos_surface_present, macos_surface_present_software, macos_surface_resize,
+    macos_surface_set_visible,
 };
 
 // =====================================================================
 // Backend impl
 // =====================================================================
 
-use jfn_platform_abi::{IdleInhibitLevel, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos};
+use jfn_platform_abi::{
+    IdleInhibitLevel, MenuDelivery, MenuKind, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos,
+};
 
 /// MPNowPlaying-backed [`jfn_platform_abi::MediaSink`].
 struct NowPlayingSink;
 
 impl jfn_platform_abi::MediaSink for NowPlayingSink {
-    fn start(&self) {
+    fn start(&self, _instance: &jfn_platform_abi::Instance) {
         jfn_macos_sink::jfn_macos_sink_start();
     }
 
@@ -647,31 +474,31 @@ impl Platform for MacosPlatform {
     }
 
     fn alloc_surface(&self) -> SurfaceHandle {
-        macos_alloc_surface()
+        SurfaceHandle::from_ptr(macos_alloc_surface())
     }
 
     fn free_surface(&self, s: SurfaceHandle) {
-        macos_free_surface(s);
+        macos_free_surface(s.as_ptr());
     }
 
-    fn surface_present(&self, s: SurfaceHandle, info: *const c_void) -> bool {
-        macos_surface_present(s, info)
-    }
-
-    fn surface_present_software(
-        &self,
-        s: SurfaceHandle,
-        dirty: &[JfnRect],
-        buffer: *const c_void,
-        w: c_int,
-        h: c_int,
-    ) -> bool {
-        macos_surface_present_software(s, dirty.as_ptr(), dirty.len(), buffer, w, h)
+    fn surface_present(&self, s: SurfaceHandle, frame: PaintFrame<'_>) -> bool {
+        match frame {
+            PaintFrame::Accelerated(tex) => macos_surface_present(s.as_ptr(), &tex),
+            // CEF on macOS runs hardware-accelerated
+            // (shared_texture_supported = true), so this is only reachable
+            // with --disable-gpu-compositing; the painter draws both frame
+            // kinds, so there is nothing to gain by refusing one.
+            PaintFrame::Software {
+                size,
+                pixels,
+                dirty,
+            } => macos_surface_present_software(s.as_ptr(), pixels, size, dirty),
+        }
     }
 
     fn surface_resize(&self, s: SurfaceHandle, size: SurfaceSize) {
         macos_surface_resize(
-            s,
+            s.as_ptr(),
             size.logical_w,
             size.logical_h,
             size.physical_w,
@@ -680,19 +507,17 @@ impl Platform for MacosPlatform {
     }
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
-        macos_surface_set_visible(s, visible);
+        macos_surface_set_visible(s.as_ptr(), visible);
     }
 
     fn restack(&self, ordered: &[SurfaceHandle]) {
-        macos_restack(ordered.as_ptr(), ordered.len());
+        // `SurfaceHandle` is `#[repr(transparent)]` over `*mut c_void`, so the
+        // slice pointer reinterprets directly.
+        macos_restack(ordered.as_ptr() as *const *mut c_void, ordered.len());
     }
 
-    fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
-        &dropdown::NsMenuDropdown
-    }
-
-    fn context_menu_backend(&self) -> &'static dyn jfn_platform_abi::ContextMenuBackend {
-        context_menu::backend()
+    fn menu_delivery(&self, _kind: MenuKind) -> MenuDelivery {
+        MenuDelivery::Host(&menu::NsMenuHost)
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
@@ -708,21 +533,9 @@ impl Platform for MacosPlatform {
     }
 
     fn cef_paths(&self) -> jfn_platform_abi::CefPaths {
-        use std::path::PathBuf;
-        let mut buf = vec![0u8; 4096];
-        let mut size = buf.len() as u32;
-        unsafe {
-            // _NSGetExecutablePath signature: (char* buf, uint32_t* bufsize) -> i32
-            unsafe extern "C" {
-                fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> i32;
-            }
-            _NSGetExecutablePath(buf.as_mut_ptr() as *mut _, &mut size);
-        }
-        let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        let exe = std::fs::canonicalize(PathBuf::from(
-            std::str::from_utf8(&buf[..nul]).unwrap_or(""),
-        ))
-        .unwrap_or_default();
+        let exe = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .unwrap_or_default();
         let app_contents = exe.parent().and_then(|p| p.parent()).unwrap_or(&exe);
         let framework = app_contents
             .join("Frameworks")

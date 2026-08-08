@@ -12,18 +12,15 @@ crate-type = ["rlib"]
 name = "jellium-desktop"
 path = "src/main.rs"
 
-[[example]]
-name = "external_frontend"
-required-features = ["external-frontend"]
-
 [features]
 default = ["kde-palette"]
-external-frontend = ["dep:url", "jfn-cef/external-frontend"]
 kde-palette = ["jfn-wayland/kde-palette"]
+external-frontend = ["jfn-cef/external-frontend", "dep:url"]
 
 [dependencies]
 tracing.workspace = true
 parking_lot.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 url = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v4"] }
@@ -37,7 +34,9 @@ jfn-logging = { path = "../logging" }
 jfn-mpv = { path = "../mpv" }
 jfn-paths = { path = "../paths" }
 jfn-playback = { path = "../playback" }
+jfn-instance-ipc = { path = "../instance_ipc" }
 jfn-wake-event = { path = "../wake_event" }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 
 [target.'cfg(target_os = "macos")'.dependencies]

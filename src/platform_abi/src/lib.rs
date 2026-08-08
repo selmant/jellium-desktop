@@ -11,16 +11,18 @@
 
 #![allow(non_snake_case)]
 
+use parking_lot::{Condvar, Mutex};
 use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub mod cef_host;
-pub mod context_menu;
-pub mod dropdown;
 pub mod geometry;
+pub mod instance;
 pub mod media_sink;
+pub mod menu;
 pub mod mpv_host;
+pub mod osr_popup;
 #[cfg_attr(unix, path = "process_unix.rs")]
 #[cfg_attr(not(unix), path = "process_other.rs")]
 mod process;
@@ -30,20 +32,20 @@ mod signal;
 pub mod window_source;
 
 pub use cef_host::CefHost;
-pub use context_menu::{
-    ContextMenuBackend, ContextMenuScript, ContextMenuStyle, Delivery, DeliveryKind,
-    JfnContextMenuRequest, JfnMenuItem, JsMenuChannel, JsMenuContextMenu, MenuSelectionFn,
-    context_menu_style,
-};
-pub use dropdown::{
-    DropdownBackend, DropdownScript, DropdownStyle, JfnPopupRequest, JsMenuDropdown, dropdown_style,
-};
 pub use geometry::{
-    BootGeometry, LogicalSize, PhysicalSize, Scale, SurfaceSize, WindowExtent, WindowGeometry,
-    WindowPos,
+    BootGeometry, LogicalPoint, LogicalSize, PhysicalPoint, PhysicalSize, Scale, SurfaceSize,
+    WindowExtent, WindowGeometry, WindowPos,
 };
+pub use instance::{Instance, InstanceId};
+pub use jfn_gpu_paint::DamageRect as JfnRect;
 pub use media_sink::MediaSink;
-pub use mpv_host::{DefaultMpvHost, MpvHost};
+pub use menu::{
+    Generation, MENU_DISMISSED, MenuClose, MenuDelivery, MenuHost, MenuItem, MenuKind, MenuMetrics,
+    MenuPaint, MenuPlacement, MenuRequest, MenuScript, MenuSelection, PopupSurface, menu_delivery,
+    menu_has_selectable, menu_initial_row, menu_scripts,
+};
+pub use mpv_host::{DefaultMpvHost, MpvHost, VO_WAIT_TICK};
+pub use osr_popup::{NoOsrPopup, OsrPopupSurface};
 pub use window_source::{
     WindowSnapshot, WindowSource, notify_window_changed, subscribe_window_changed,
 };
@@ -70,38 +72,28 @@ pub use signal::SignalGuard;
 // (`[NSApp run]` / stop-NSApp) and never touches this.
 
 struct MainPark {
-    woken: std::sync::Mutex<bool>,
-    cv: std::sync::Condvar,
+    woken: Mutex<bool>,
+    cv: Condvar,
 }
 
 static MAIN_PARK: MainPark = MainPark {
-    woken: std::sync::Mutex::new(false),
-    cv: std::sync::Condvar::new(),
+    woken: Mutex::new(false),
+    cv: Condvar::new(),
 };
 
 /// Block until [`main_park_signal`] is called. Returns immediately if the
 /// signal already fired (latched), so a wake racing ahead of the wait is
 /// not lost.
 pub fn main_park_wait() {
-    let mut woken = MAIN_PARK
-        .woken
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut woken = MAIN_PARK.woken.lock();
     while !*woken {
-        woken = MAIN_PARK
-            .cv
-            .wait(woken)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        MAIN_PARK.cv.wait(&mut woken);
     }
 }
 
 /// Release [`main_park_wait`]. Idempotent and safe from any thread.
 pub fn main_park_signal() {
-    let mut woken = MAIN_PARK
-        .woken
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *woken = true;
+    *MAIN_PARK.woken.lock() = true;
     MAIN_PARK.cv.notify_all();
 }
 
@@ -336,12 +328,20 @@ impl DecorationOptions {
     }
 }
 
-#[repr(C)]
-pub struct JfnRect {
-    pub x: c_int,
-    pub y: c_int,
-    pub w: c_int,
-    pub h: c_int,
+/// One CEF paint callback's payload, decoded.
+///
+/// CEF has exactly two output paths — `OnAcceleratedPaint` and `OnPaint` —
+/// selected once per browser by `shared_texture_enabled`.
+pub enum PaintFrame<'a> {
+    /// A texture the app owns. By value, because a backend that presents off
+    /// the callback thread (X11 and Wayland both do) has to keep it.
+    Accelerated(jfn_gpu_paint::SharedTexture),
+    /// CPU pixels in BGRA, tightly packed, with the regions that changed.
+    Software {
+        size: PhysicalSize,
+        pixels: &'a [u8],
+        dirty: &'a [JfnRect],
+    },
 }
 
 /// Idle-inhibit level.
@@ -352,13 +352,58 @@ pub enum IdleInhibitLevel {
     Display,
 }
 
-/// Backend-allocated per-surface handle. Backends define the layout
-/// in-crate; callers only ever hold the raw pointer.
-pub type SurfaceHandle = *mut c_void;
+/// Backend-allocated per-surface handle: an opaque, backend-defined id.
+///
+/// Callers hold it as a value and pass it back verbatim; no caller may
+/// dereference it. Its representation is one machine word so it round-trips
+/// losslessly through the CEF C++ layer's `void*` slot. Pointer-backed
+/// backends (Wayland/Windows/macOS) bridge through [`SurfaceHandle::from_ptr`]
+/// / [`SurfaceHandle::as_ptr`]; the X11 backend stores a generational id via
+/// [`SurfaceHandle::from_id`] / [`SurfaceHandle::id`] and never treats it as a
+/// pointer.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[repr(transparent)]
+pub struct SurfaceHandle(*mut c_void);
 
-/// Single-instance listener callback; the `&str` is the activation token
-/// (empty on Windows / when none).
-pub type Callback = Box<dyn Fn(&str) + Send>;
+// A word-sized opaque id; the wrapped pointer is never dereferenced by the ABI
+// itself. Backends carry their own `unsafe impl Send` on the state they map it to.
+unsafe impl Send for SurfaceHandle {}
+unsafe impl Sync for SurfaceHandle {}
+
+impl SurfaceHandle {
+    /// The absent handle (allocation failed / no surface).
+    pub const NONE: Self = Self(std::ptr::null_mut());
+
+    #[must_use]
+    pub fn is_none(self) -> bool {
+        self.0.is_null()
+    }
+
+    /// Bridge for pointer-backed backends: wrap a backend surface pointer.
+    #[must_use]
+    pub fn from_ptr(p: *mut c_void) -> Self {
+        Self(p)
+    }
+
+    /// Bridge for pointer-backed backends: recover the backend surface pointer.
+    #[must_use]
+    pub fn as_ptr(self) -> *mut c_void {
+        self.0
+    }
+
+    /// Bridge for id-backed backends (X11): pack a generational id. The value
+    /// is never dereferenced.
+    #[must_use]
+    pub fn from_id(id: u64) -> Self {
+        Self(id as *mut c_void)
+    }
+
+    /// Bridge for id-backed backends (X11): recover the generational id.
+    #[must_use]
+    pub fn id(self) -> u64 {
+        self.0 as u64
+    }
+}
 
 /// Process-wide platform handle. Optional methods have no-op defaults so
 /// backends only override what they care about.
@@ -400,33 +445,23 @@ pub trait Platform: Send + Sync {
 
     // Per-surface
     fn alloc_surface(&self) -> SurfaceHandle {
-        std::ptr::null_mut()
+        SurfaceHandle::NONE
     }
     fn free_surface(&self, _s: SurfaceHandle) {}
-    /// `_info` is CEF's `OnAcceleratedPaint` accel-paint info — a raw C
-    /// pointer that crosses the CEF ABI, so it stays raw.
-    fn surface_present(&self, _s: SurfaceHandle, _info: *const c_void) -> bool {
-        false
-    }
-    /// `_buffer` is CEF's `OnPaint` software paint buffer — a raw C pointer
-    /// that crosses the CEF ABI, so it stays raw.
-    fn surface_present_software(
-        &self,
-        _s: SurfaceHandle,
-        _dirty: &[JfnRect],
-        _buffer: *const c_void,
-        _w: c_int,
-        _h: c_int,
-    ) -> bool {
+    fn surface_present(&self, _s: SurfaceHandle, _frame: PaintFrame<'_>) -> bool {
         false
     }
     fn surface_resize(&self, _s: SurfaceHandle, _size: SurfaceSize) {}
     fn surface_set_visible(&self, _s: SurfaceHandle, _visible: bool) {}
     fn restack(&self, _ordered: &[SurfaceHandle]) {}
 
-    fn dropdown_backend(&self) -> &'static dyn DropdownBackend;
+    /// How this backend delivers `kind`; `Host` names the backend's own menu
+    /// host.
+    fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery;
 
-    fn context_menu_backend(&self) -> &'static dyn ContextMenuBackend;
+    fn osr_popup_surface(&self) -> &dyn OsrPopupSurface {
+        &NoOsrPopup
+    }
 
     /// How this platform hosts mpv's lifecycle (env prep, VO wait,
     /// teardown detach). Default: mpv needs nothing from the platform.
@@ -502,7 +537,7 @@ pub trait Platform: Send + Sync {
     /// Live window-geometry authority for this backend: the compositor-backed
     /// source where the backend owns its toplevel (Wayland), the mpv-backed
     /// source everywhere else.
-    fn window_source(&self) -> &'static dyn WindowSource;
+    fn window_source(&self) -> &dyn WindowSource;
 
     /// The mpv `--geometry` string for boot, or `None` when the backend owns
     /// its toplevel and sizes it itself. The default sizes via mpv; toplevel-
@@ -572,6 +607,14 @@ pub trait Platform: Send + Sync {
     fn shared_texture_supported(&self) -> bool {
         true
     }
+
+    /// True where `CefInitialize` depends on neither platform init nor a run
+    /// loop the boot wait owns, so CEF's process bring-up may run while mpv's
+    /// core thread creates the VO. False on Wayland and X11 (platform init
+    /// resolves shared-texture support) and on macOS (external pump).
+    fn cef_init_precedes_mpv_window(&self) -> bool {
+        false
+    }
     /// Set during init by Wayland backend (dmabuf probe) when GPU lacks the
     /// shared-texture path.
     fn set_shared_texture_unsupported(&self) {}
@@ -608,20 +651,6 @@ pub trait Platform: Send + Sync {
     /// `on_shutdown` must be async-signal-safe.
     fn install_shutdown_handler(&self, on_shutdown: fn()) {
         process::install_shutdown(on_shutdown);
-    }
-
-    /// Returns `true` if an existing instance was reached (caller should exit).
-    fn single_instance_try_signal(&self, instance_id: &str) -> bool {
-        process::try_signal_existing(instance_id)
-    }
-
-    /// `cb` runs on the listener thread with the activation token.
-    fn single_instance_start_listener(&self, instance_id: &str, cb: Callback) -> bool {
-        process::start_listener(instance_id, cb)
-    }
-
-    fn single_instance_stop(&self, instance_id: &str) {
-        process::stop_listener(instance_id);
     }
 }
 

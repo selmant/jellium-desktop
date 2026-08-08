@@ -12,6 +12,7 @@
 //! eventually run sees `None` and exits.
 
 use cef::{Browser, RunContextMenuCallback};
+use crossbeam_utils::atomic::AtomicCell;
 use parking_lot::{Condvar, Mutex};
 use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
@@ -24,6 +25,7 @@ use crate::sink_routing::Handle;
 
 use crate::paint_scheduler::{PaintMode, PaintScheduler};
 
+mod accel;
 mod browser_ops;
 mod callbacks;
 mod events;
@@ -38,6 +40,10 @@ pub use ffi::{jfn_cef_layer_create, jfn_cef_layer_wait_for_load};
 pub(crate) use tasks::{
     jfn_cef_post_close_and_collect, jfn_cef_post_csd_state_all, jfn_cef_post_set_hidden_all,
 };
+
+// A word-sized handle must never fall back to AtomicCell's global-lock
+// path: it is read on every paint.
+const _: () = assert!(AtomicCell::<platform_ops::SurfaceHandle>::is_lock_free());
 
 const STATE_NORMAL: i32 = 0;
 const STATE_PENDING_RESET: i32 = 1;
@@ -69,15 +75,12 @@ pub(crate) struct Inner {
     browser: Mutex<Option<Browser>>,
     // Pending RunContextMenuCallback — held while a context menu is open.
     pending_menu_callback: Mutex<Option<RunContextMenuCallback>>,
-    // Selection callback parked by the JS-rendered context-menu backend;
-    // fired by the menuItemSelected / menuDismissed IPC (-1 = dismissed).
-    pending_menu_on_selected: Mutex<Option<jfn_platform_abi::MenuSelectionFn>>,
     // Injection-profile kind ("web" / "overlay" / "about") — looked up at
     // browser-create time to build the extra_info DictionaryValue.
     injection_kind: Mutex<String>,
     // Opaque per-layer surface handle (PlatformSurface*); passed back to the
     // C++ platform vtable for surface_resize / present / popup.
-    surface: Mutex<*mut c_void>,
+    surface: AtomicCell<platform_ops::SurfaceHandle>,
     visible: AtomicBool,
 
     // logical/physical dims (slice 3)
@@ -101,8 +104,7 @@ pub(crate) struct Inner {
     // arrives via OnPopupSize, options via the "popupOptions" renderer IPC;
     // try_show_popup fires when popup_visible + size_received + options_received.
     popup: Mutex<PopupState>,
-    dropdown: &'static dyn jfn_platform_abi::DropdownBackend,
-    pub(crate) context_menu: &'static dyn jfn_platform_abi::ContextMenuBackend,
+    dropdown: jfn_platform_abi::MenuDelivery,
 
     // lifecycle / reset state machine (slice 5)
     state: AtomicI32,
@@ -156,8 +158,9 @@ struct PopupState {
     options_received: bool,
 }
 
-// SAFETY: surface is a C++ pointer treated as opaque; only handed back to
-// the platform vtable on TID_UI.
+// SAFETY: `Inner` is not auto-Send/Sync only because of the CEF ref-counted
+// handles it stores (`Browser`, `RunContextMenuCallback`); those live behind
+// `Inner`'s own mutexes and CEF ref-counts them atomically.
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
 
@@ -176,9 +179,8 @@ impl Inner {
             load_cv: Condvar::new(),
             browser: Mutex::new(None),
             pending_menu_callback: Mutex::new(None),
-            pending_menu_on_selected: Mutex::new(None),
             injection_kind: Mutex::new(String::new()),
-            surface: Mutex::new(std::ptr::null_mut()),
+            surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
             visible: AtomicBool::new(true),
             width: AtomicI32::new(0),
             height: AtomicI32::new(0),
@@ -193,8 +195,7 @@ impl Inner {
                 selected_idx: -1,
                 ..PopupState::default()
             }),
-            dropdown: jfn_platform_abi::get().dropdown_backend(),
-            context_menu: jfn_platform_abi::get().context_menu_backend(),
+            dropdown: jfn_platform_abi::menu_delivery(jfn_platform_abi::MenuKind::Dropdown),
             state: AtomicI32::new(STATE_NORMAL),
             pending_url: Mutex::new(String::new()),
             has_browser: AtomicBool::new(false),
@@ -233,8 +234,8 @@ impl Inner {
         self.cursor_handle.get().copied()
     }
 
-    fn surface_ptr(&self) -> *mut c_void {
-        *self.surface.lock()
+    fn surface_handle(&self) -> platform_ops::SurfaceHandle {
+        self.surface.load()
     }
 }
 

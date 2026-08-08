@@ -15,9 +15,9 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 use url::Url;
 
-use crate::app::userfree_to_string;
 use crate::browsers::{jfn_browsers_create, jfn_browsers_set_active};
 use crate::business_overlay::jfn_overlay_hide;
+use crate::cef_string::userfree_to_string;
 use crate::client::{
     Inner, JfnCefLayer, jfn_cef_layer_create, jfn_cef_layer_inner, jfn_cef_layer_set_name,
     jfn_cef_layer_set_visible,

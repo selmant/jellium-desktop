@@ -3,8 +3,10 @@
 //! serviced while mpv brings its window up.
 
 use std::ffi::c_int;
+use std::time::Duration;
 
-use jfn_platform_abi::{MpvHost, WindowDecorations};
+use jfn_platform_abi::{MpvHost, VO_WAIT_TICK, WindowDecorations};
+use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily};
 
 /// Whether the system's Metal device advertises the Mac2 GPU family.
 ///
@@ -16,21 +18,14 @@ use jfn_platform_abi::{MpvHost, WindowDecorations};
 /// workaround tied to the actual capability. Returns `true` when no Metal
 /// device is present, so a machine we cannot probe keeps the fast path.
 fn metal_has_mac2_family() -> bool {
-    use objc2::runtime::AnyObject;
-    // MTLGPUFamilyMac2, from <Metal/MTLDevice.h>.
-    const MTL_GPU_FAMILY_MAC2: isize = 2002;
-    #[link(name = "Metal", kind = "framework")]
-    unsafe extern "C" {
-        fn MTLCreateSystemDefaultDevice() -> *mut AnyObject;
-    }
-    unsafe {
-        let device = MTLCreateSystemDefaultDevice();
-        if device.is_null() {
-            return true;
-        }
-        let has_mac2: bool = objc2::msg_send![device, supportsFamily: MTL_GPU_FAMILY_MAC2];
-        let _: () = objc2::msg_send![device, release];
-        has_mac2
+    // MTLCreateSystemDefaultDevice resolves through CoreGraphics.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {}
+
+    match MTLCreateSystemDefaultDevice() {
+        Some(device) => device.supportsFamily(MTLGPUFamily::Mac2),
+        // No Metal device to probe: keep the fast path.
+        None => true,
     }
 }
 
@@ -69,7 +64,7 @@ impl MpvHost for MacosMpvHost {
         }
     }
 
-    fn run_vo_wait(&self, pump: &mut dyn FnMut(bool) -> bool) {
+    fn run_vo_wait(&self, pump: &mut dyn FnMut(Duration) -> bool) {
         unsafe {
             jfn_mpv::api::jfn_mpv_set_wakeup_callback(
                 crate::macos_mpv_wakeup_cb,
@@ -79,8 +74,8 @@ impl MpvHost for MacosMpvHost {
         // Block until the main run loop services a source — e.g. the
         // dispatch block posted by the wakeup callback — never inside
         // mpv's own blocking wait, which would starve the run loop.
-        while pump(false) {
-            crate::macos_pump_block(60.0);
+        while pump(Duration::ZERO) {
+            crate::macos_pump_block(VO_WAIT_TICK.as_secs_f64());
         }
         jfn_mpv::api::jfn_mpv_clear_wakeup_callback();
     }

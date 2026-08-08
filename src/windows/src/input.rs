@@ -19,6 +19,9 @@ use windows::Win32::System::SystemServices::{
     MK_RBUTTON, MK_SHIFT,
 };
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_ADD, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CAPITAL, VK_CLEAR,
     VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_F4, VK_HOME, VK_INSERT,
@@ -42,12 +45,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, w};
 
-// Not re-exported by windows-rs 0.62's WindowsAndMessaging metadata.
 const WM_MOUSELEAVE: u32 = 0x02A3;
-
-// =====================================================================
-// CEF cursor-type ordinals + event flags (mirrors cef_types.h)
-// =====================================================================
 
 use jfn_input::buttons::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use jfn_platform_abi::cursor::CursorShape;
@@ -57,6 +55,7 @@ use jfn_platform_abi::event_flags::{
     EVENTFLAG_MIDDLE_MOUSE_BUTTON, EVENTFLAG_NUM_LOCK_ON, EVENTFLAG_RIGHT_MOUSE_BUTTON,
     EVENTFLAG_SHIFT_DOWN,
 };
+use jfn_platform_abi::{LogicalPoint, PhysicalPoint};
 
 use jfn_input::{
     jfn_input_dispatch_char_sys, jfn_input_dispatch_history_nav, jfn_input_dispatch_key_full,
@@ -65,12 +64,7 @@ use jfn_input::{
 };
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 
-// =====================================================================
-// Shared state. `set_cursor` is invoked from the CEF UI thread; the
-// input thread reads `cursor_type` from WM_SETCURSOR. `input_hwnd_raw`
-// and `thread_id` are written once during run_input_thread startup and
-// read by the cross-thread set_cursor / stop / resize helpers.
-// =====================================================================
+use crate::menu::{WM_JFN_MENU_END, WM_JFN_MENU_TRACK};
 
 struct State {
     input_hwnd_raw: usize,
@@ -84,10 +78,12 @@ static STATE: Mutex<State> = Mutex::new(State {
     cursor_type: CursorShape::Pointer.as_raw(),
 });
 
-// =====================================================================
-// Win32 macro helpers — windows-rs doesn't ship the *_LPARAM / *_WPARAM
-// macros from Windows headers, so reimplement the ones we need inline.
-// =====================================================================
+/// The input child window, or `None` before the input thread creates it and
+/// after it tears it down.
+pub(crate) fn input_hwnd() -> Option<HWND> {
+    let raw = STATE.lock().input_hwnd_raw;
+    (raw != 0).then(|| HWND(raw as *mut _))
+}
 
 #[inline]
 fn loword_u32(v: u32) -> u16 {
@@ -117,10 +113,6 @@ fn get_xbutton_wparam(wp: WPARAM) -> u16 {
 fn get_appcommand_lparam(lp: LPARAM) -> u16 {
     (hiword_i16(lp.0 as u32) as u16) & 0x7FFF
 }
-
-// =====================================================================
-// Modifier helpers.
-// =====================================================================
 
 #[inline]
 fn is_key_down(vk: u16) -> bool {
@@ -238,10 +230,6 @@ fn keyboard_modifiers(wp: WPARAM, lp: LPARAM) -> u32 {
     m
 }
 
-// =====================================================================
-// Cursor mapping.
-// =====================================================================
-
 fn cef_cursor_to_win(shape: CursorShape) -> PCWSTR {
     use CursorShape::*;
     match shape {
@@ -261,10 +249,6 @@ fn cef_cursor_to_win(shape: CursorShape) -> PCWSTR {
     }
 }
 
-// =====================================================================
-// Mouse button helpers.
-// =====================================================================
-
 fn msg_to_button_code(msg: u32) -> u32 {
     match msg {
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => BTN_LEFT,
@@ -279,9 +263,30 @@ fn is_button_down(msg: u32) -> bool {
     matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN)
 }
 
-// =====================================================================
-// WndProc.
-// =====================================================================
+/// The pointer position in the space CEF's view was sized in, mapped through
+/// the extent `crate::window` last sampled. The identity before the first
+/// sample exists.
+fn view_point(x: i32, y: i32) -> LogicalPoint {
+    let physical = PhysicalPoint { x, y };
+    crate::window::client_extent().map_or(LogicalPoint { x, y }, |e| e.to_logical_point(physical))
+}
+
+/// One debug line per press.
+fn log_press(msg: u32, physical: PhysicalPoint, logical: LogicalPoint) {
+    let Some(extent) = crate::window::client_extent() else {
+        return;
+    };
+    let logical_size = extent.logical();
+    let physical_size = extent.physical();
+    let scale = extent.scale();
+    tracing::debug!(
+        target: "platform",
+        "press msg=0x{msg:04x} physical=({},{}) logical=({},{}) \
+         extent=logical {}x{} physical {}x{} scale {}",
+        physical.x, physical.y, logical.x, logical.y,
+        logical_size.w, logical_size.h, physical_size.w, physical_size.h, scale.0,
+    );
+}
 
 unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
@@ -298,12 +303,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSEMOVE => {
-            jfn_input_dispatch_mouse_move(
-                get_x_lparam(lp),
-                get_y_lparam(lp),
-                mouse_modifiers(wp),
-                0,
-            );
+            let p = view_point(get_x_lparam(lp), get_y_lparam(lp));
+            jfn_input_dispatch_mouse_move(p.x, p.y, mouse_modifiers(wp), 0);
             return LRESULT(0);
         }
 
@@ -318,11 +319,19 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             if down {
                 let _ = unsafe { SetFocus(Some(hwnd)) };
             }
+            let physical = PhysicalPoint {
+                x: get_x_lparam(lp),
+                y: get_y_lparam(lp),
+            };
+            let p = view_point(physical.x, physical.y);
+            if down {
+                log_press(msg, physical, p);
+            }
             jfn_input_dispatch_mouse_button(
                 msg_to_button_code(msg),
                 if down { 1 } else { 0 },
-                get_x_lparam(lp),
-                get_y_lparam(lp),
+                p.x,
+                p.y,
                 mouse_modifiers(wp),
             );
             return LRESULT(0);
@@ -334,7 +343,7 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let fwd = if btn == XBUTTON2 { 1 } else { 0 };
                 jfn_input_dispatch_history_nav(fwd);
             }
-            return LRESULT(1); // TRUE per MSDN
+            return LRESULT(1);
         }
 
         WM_APPCOMMAND => {
@@ -347,7 +356,6 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 jfn_input_dispatch_history_nav(1);
                 return LRESULT(1);
             }
-            // bubble unhandled commands to parent via DefWindowProc.
         }
 
         WM_MOUSEWHEEL => {
@@ -359,7 +367,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
-            jfn_input_dispatch_scroll(pt.x, pt.y, 0, delta, mouse_modifiers(wp));
+            let p = view_point(pt.x, pt.y);
+            jfn_input_dispatch_scroll(p.x, p.y, 0, delta, mouse_modifiers(wp));
             return LRESULT(0);
         }
 
@@ -372,7 +381,8 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = ScreenToClient(hwnd, &mut pt);
             }
             let delta = hiword_i16(wp.0 as u32) as i32;
-            jfn_input_dispatch_scroll(pt.x, pt.y, delta, 0, mouse_modifiers(wp));
+            let p = view_point(pt.x, pt.y);
+            jfn_input_dispatch_scroll(p.x, p.y, delta, 0, mouse_modifiers(wp));
             return LRESULT(0);
         }
 
@@ -382,7 +392,6 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 jfn_shutdown_initiate();
                 return LRESULT(0);
             }
-            // Browser nav keystrokes (some IR drivers).
             if vk == VK_BROWSER_BACK.0 || vk == VK_BROWSER_FORWARD.0 {
                 if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                     let fwd = if vk == VK_BROWSER_FORWARD.0 { 1 } else { 0 };
@@ -414,6 +423,11 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             return LRESULT(0);
         }
 
+        WM_JFN_MENU_TRACK | WM_JFN_MENU_END => {
+            crate::menu::on_input_message(hwnd, msg);
+            return LRESULT(0);
+        }
+
         WM_SETFOCUS => {
             jfn_input_dispatch_keyboard_focus(1);
             return LRESULT(0);
@@ -428,15 +442,9 @@ unsafe extern "system" fn input_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-// =====================================================================
-// Thread entry — registers the class, creates the child window, runs
-// the message loop, then cleans up. Called from std::thread::spawn in
-// platform.rs::win_init.
-// =====================================================================
-
 const CLASS_NAME: PCWSTR = w!("JellyfinCefInput");
 
-pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
+pub(crate) fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
     let mpv = HWND(mpv_hwnd);
     let tid = unsafe { GetCurrentThreadId() };
 
@@ -455,7 +463,6 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
         cbWndExtra: 0,
         hInstance: hinst.into(),
         hIcon: HICON::default(),
-        // No class cursor — WM_SETCURSOR drives it.
         hCursor: HCURSOR::default(),
         hbrBackground: Default::default(),
         lpszMenuName: PCWSTR::null(),
@@ -494,12 +501,24 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
     };
     STATE.lock().input_hwnd_raw = input_hwnd.0 as usize;
 
-    // Share input queue with mpv so SetFocus across windows works.
+    {
+        let mut ir = RECT::default();
+        let _ = unsafe { GetClientRect(input_hwnd, &mut ir) };
+        let thread_awareness =
+            unsafe { GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) }.0;
+        tracing::debug!(
+            target: "platform",
+            "input window: size={}x{} parent_client={}x{} thread_awareness={}",
+            ir.right - ir.left, ir.bottom - ir.top,
+            rc.right - rc.left, rc.bottom - rc.top,
+            thread_awareness,
+        );
+    }
+
     let mpv_tid = unsafe { GetWindowThreadProcessId(mpv, None) };
     let _ = unsafe { AttachThreadInput(tid, mpv_tid, true) };
     let _ = unsafe { SetFocus(Some(input_hwnd)) };
 
-    // Standard GetMessage/Dispatch loop.
     let mut m = MSG::default();
     while unsafe { GetMessageW(&mut m, None, 0, 0).0 } > 0 {
         unsafe {
@@ -516,14 +535,14 @@ pub fn jfn_input_windows_run_input_thread(mpv_hwnd: *mut std::ffi::c_void) {
     STATE.lock().thread_id = 0;
 }
 
-pub fn jfn_input_windows_stop_input_thread() {
+pub(crate) fn jfn_input_windows_stop_input_thread() {
     let tid = STATE.lock().thread_id;
     if tid != 0 {
         let _ = unsafe { PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0)) };
     }
 }
 
-pub fn jfn_input_windows_resize_to_parent(pw: c_int, ph: c_int) {
+pub(crate) fn jfn_input_windows_resize_to_parent(pw: c_int, ph: c_int) {
     let hwnd_raw = STATE.lock().input_hwnd_raw;
     if hwnd_raw == 0 {
         return;
@@ -537,7 +556,7 @@ pub fn jfn_input_windows_resize_to_parent(pw: c_int, ph: c_int) {
 /// Platform::set_cursor — invoked from the CEF UI thread. Stores the
 /// pending cursor type and posts a synthetic WM_SETCURSOR so the input
 /// thread applies it via SetCursor (which is thread-affine).
-pub fn jfn_input_windows_set_cursor(t: c_int) {
+pub(crate) fn jfn_input_windows_set_cursor(t: c_int) {
     let hwnd_raw = {
         let mut s = STATE.lock();
         s.cursor_type = t;
@@ -547,6 +566,5 @@ pub fn jfn_input_windows_set_cursor(t: c_int) {
         return;
     }
     let hwnd = HWND(hwnd_raw as *mut _);
-    // wparam = hwnd, lparam = MAKELPARAM(HTCLIENT=1, 0)
     let _ = unsafe { PostMessageW(Some(hwnd), WM_SETCURSOR, WPARAM(hwnd_raw), LPARAM(1)) };
 }

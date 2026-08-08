@@ -1,88 +1,464 @@
-mod lifecycle_fsm;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, Sender, channel};
-
+use calloop::channel::{Channel, Sender};
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{EventLoop, LoopHandle, LoopSignal};
+use parking_lot::Mutex;
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::shm::ConnectionExt as ShmConnectionExt;
 use x11rb::protocol::xproto::{
-    ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux, EventMask, GrabMode,
-    GrabStatus, ImageFormat, StackMode, WindowClass,
+    ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux,
+    EventMask, GrabMode, GrabStatus, ImageFormat, StackMode, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 
+use jfn_linux_util::menu::{MenuPoint, SoftwareMenu};
+use jfn_platform_abi::{
+    Generation, MenuClose, MenuHost, MenuMetrics, MenuPaint, MenuPlacement, PopupSurface,
+};
+
+use crate::conn_source::X11Source;
 use crate::shm::{shm_alloc, shm_free};
-use crate::x11_state::{MUT, ShmBuffer};
-use jfn_menu::interaction_fsm::{self, MenuEffect, MenuEvent, MenuState};
-use jfn_menu::render::{self, Fonts, Layout};
-use lifecycle_fsm::{Life, LifeEffect, LifeEvent};
+use crate::x11_state::ShmBuffer;
 
-pub use jfn_menu::MenuItem;
+const GRAB_RETRY: Duration = Duration::from_millis(5);
+const GRAB_ATTEMPTS: u32 = 40;
 
-pub struct MenuRequest {
-    /// CEF view (logical, unscaled) coordinates of the click.
-    pub x: i32,
-    pub y: i32,
-    pub items: Vec<MenuItem>,
-    pub on_selected: Option<Box<dyn FnOnce(i32) + Send>>,
+static MENU: OnceLock<SoftwareMenu> = OnceLock::new();
+
+pub fn warm() {
+    host().warm();
 }
 
-static SENDER: OnceLock<Option<Sender<MenuRequest>>> = OnceLock::new();
+pub fn host() -> &'static SoftwareMenu {
+    MENU.get_or_init(|| {
+        let surface = Arc::new(X11PopupSurface {
+            tx: Mutex::new(None),
+        });
+        spawn_popup(&surface);
+        SoftwareMenu::spawn(surface)
+    })
+}
 
-pub fn show(req: MenuRequest) {
-    tracing::debug!(
-        target: "x11::menu",
-        "show: {} items at view=({},{})",
-        req.items.len(),
-        req.x,
-        req.y,
-    );
-    match SENDER.get_or_init(spawn_worker) {
-        Some(tx) => {
-            if let Err(e) = tx.send(req) {
-                tracing::error!(target: "x11::menu", "show: worker gone; dismissing");
-                fire(e.0.on_selected, -1);
-            }
-        }
-        None => {
-            tracing::error!(target: "x11::menu", "show: no worker thread; dismissing");
-            fire(req.on_selected, -1);
+struct X11PopupSurface {
+    tx: Mutex<Option<Sender<Op>>>,
+}
+
+impl X11PopupSurface {
+    /// False when the op could not be queued for the popup thread.
+    fn send(&self, op: Op) -> bool {
+        let slot = self.tx.lock();
+        let Some(tx) = slot.as_ref() else {
+            return false;
+        };
+        tx.send(op).is_ok()
+    }
+
+    /// Stops accepting ops, then dismisses every menu left in the queue. `rx` is
+    /// `None` once the event loop owns the channel and it cannot be reclaimed.
+    fn close(&self, rx: Option<Channel<Op>>) {
+        let doomed: Vec<Generation> = {
+            let mut slot = self.tx.lock();
+            *slot = None;
+            rx.into_iter()
+                .flat_map(|rx| {
+                    std::iter::from_fn(move || rx.try_recv().ok()).filter_map(|op| match op {
+                        Op::Create { generation, .. } => Some(generation),
+                        _ => None,
+                    })
+                })
+                .collect()
+        };
+        for generation in doomed {
+            host().on_done(generation);
         }
     }
 }
 
-fn fire(cb: Option<Box<dyn FnOnce(i32) + Send>>, result: i32) {
-    if let Some(cb) = cb {
-        cb(result);
+impl PopupSurface for X11PopupSurface {
+    fn metrics(&self) -> MenuMetrics {
+        let scale = crate::x11_state::parent_snapshot().scale;
+        MenuMetrics {
+            scale: if scale > 0.0 { scale } else { 1.0 },
+            clamp_ph: None,
+        }
+    }
+
+    fn create(&self, generation: Generation, place: MenuPlacement, _serial: u32) {
+        if !self.send(Op::Create { generation, place }) {
+            tracing::error!(target: "x11::menu", "popup thread gone; dismissing menu");
+            host().on_done(generation);
+        }
+    }
+
+    fn reposition(&self, generation: Generation, place: MenuPlacement) {
+        self.send(Op::Reposition { generation, place });
+    }
+
+    fn present(&self, paint: MenuPaint) {
+        self.send(Op::Present(paint));
+    }
+
+    fn destroy(&self, generation: Generation, _reason: MenuClose) {
+        self.send(Op::Destroy { generation });
     }
 }
 
-fn spawn_worker() -> Option<Sender<MenuRequest>> {
-    let (tx, rx) = channel::<MenuRequest>();
-    std::thread::Builder::new()
+enum Op {
+    Create {
+        generation: Generation,
+        place: MenuPlacement,
+    },
+    Reposition {
+        generation: Generation,
+        place: MenuPlacement,
+    },
+    Present(MenuPaint),
+    Destroy {
+        generation: Generation,
+    },
+}
+
+/// Installs the sender and starts the popup thread; on spawn failure the slot
+/// is left empty and menus dismiss on arrival.
+fn spawn_popup(surface: &Arc<X11PopupSurface>) {
+    let (tx, rx) = calloop::channel::channel::<Op>();
+    let thread_surface = Arc::clone(surface);
+    match std::thread::Builder::new()
         .name("jfn-x11-menu".into())
-        .spawn(move || worker(rx))
-        .ok()?;
-    Some(tx)
+        .spawn(move || popup_thread(&thread_surface, rx))
+    {
+        Ok(_) => *surface.tx.lock() = Some(tx),
+        Err(e) => {
+            tracing::error!(target: "x11::menu", "popup thread spawn failed: {e}; menus disabled");
+        }
+    }
 }
 
-fn worker(rx: Receiver<MenuRequest>) {
+fn popup_thread(surface: &Arc<X11PopupSurface>, rx: Channel<Op>) {
     let Ok((conn, _screen)) = x11rb::connect(None) else {
-        tracing::error!(target: "x11::menu", "worker: X11 connect failed; menus disabled");
-        for req in rx {
-            fire(req.on_selected, -1);
-        }
+        tracing::error!(target: "x11::menu", "popup: X11 connect failed; menus disabled");
+        surface.close(Some(rx));
         return;
     };
-    tracing::debug!(target: "x11::menu", "worker: started");
-    let keymap = Keymap::query(&conn);
-    let mut fonts = Fonts::new();
-    for mut req in rx {
-        let cb = req.on_selected.take();
-        let result = run_menu(&conn, &keymap, &mut fonts, &req);
-        tracing::debug!(target: "x11::menu", "result: id={result}");
-        fire(cb, result);
+    let conn = Arc::new(conn);
+    let Ok(mut event_loop) = EventLoop::<'static, PopupLoop>::try_new() else {
+        tracing::error!(target: "x11::menu", "popup: calloop init failed; menus disabled");
+        surface.close(Some(rx));
+        return;
+    };
+    let handle = event_loop.handle();
+    if handle
+        .insert_source(X11Source::new(conn.clone()), |ev, (), st| st.on_event(ev))
+        .is_err()
+    {
+        tracing::error!(target: "x11::menu", "popup: event source setup failed; menus disabled");
+        surface.close(Some(rx));
+        return;
+    }
+    if let Err(e) = handle.insert_source(rx, |event, _, st| st.on_channel(event)) {
+        tracing::error!(target: "x11::menu", "popup: event source setup failed; menus disabled");
+        surface.close(Some(e.inserted));
+        return;
+    }
+    let mut state = PopupLoop {
+        keymap: Keymap::query(&conn),
+        conn,
+        phase: Phase::Idle,
+        handle,
+        signal: event_loop.get_signal(),
+    };
+    tracing::debug!(target: "x11::menu", "popup: started");
+    if let Err(e) = event_loop.run(None, &mut state, |_| {}) {
+        tracing::error!(target: "x11::menu", "popup: loop error: {e}");
+    }
+    state.tear_down();
+    surface.close(None);
+}
+
+enum Phase {
+    Idle,
+    Grabbing { window: Window, attempts: u32 },
+    Open(Window),
+}
+
+impl Phase {
+    fn window(&mut self) -> Option<&mut Window> {
+        match self {
+            Phase::Idle => None,
+            Phase::Grabbing { window, .. } | Phase::Open(window) => Some(window),
+        }
+    }
+}
+
+struct Window {
+    generation: Generation,
+    win: u32,
+    gc: u32,
+    buf: ShmBuffer,
+}
+
+struct PopupLoop {
+    conn: Arc<RustConnection>,
+    keymap: Keymap,
+    phase: Phase,
+    handle: LoopHandle<'static, PopupLoop>,
+    signal: LoopSignal,
+}
+
+impl PopupLoop {
+    fn on_channel(&mut self, event: calloop::channel::Event<Op>) {
+        match event {
+            calloop::channel::Event::Msg(op) => self.on_op(op),
+            calloop::channel::Event::Closed => {
+                self.tear_down();
+                self.signal.stop();
+            }
+        }
+    }
+
+    fn on_op(&mut self, op: Op) {
+        match op {
+            Op::Create { generation, place } => self.create(generation, place),
+            Op::Reposition { generation, place } => self.reposition(generation, place),
+            Op::Present(paint) => self.present(paint),
+            Op::Destroy { generation } => {
+                if self.owns(generation) {
+                    self.tear_down();
+                }
+            }
+        }
+    }
+
+    fn owns(&mut self, generation: Generation) -> bool {
+        self.phase
+            .window()
+            .is_some_and(|w| w.generation == generation)
+    }
+
+    fn create(&mut self, generation: Generation, place: MenuPlacement) {
+        self.tear_down();
+        let Some(window) = self.build(generation, place) else {
+            host().on_done(generation);
+            return;
+        };
+        self.phase = Phase::Grabbing {
+            window,
+            attempts: 0,
+        };
+        if self
+            .handle
+            .insert_source(Timer::from_duration(GRAB_RETRY), |_, _, st| {
+                st.on_grab_retry()
+            })
+            .is_err()
+        {
+            tracing::error!(target: "x11::menu", "create: grab timer failed; dismissing");
+            self.tear_down();
+            host().on_done(generation);
+        }
+    }
+
+    /// On `None`, nothing is left on the server for the caller to clean up.
+    fn build(&mut self, generation: Generation, place: MenuPlacement) -> Option<Window> {
+        let snap = snapshot(&self.conn).or_else(|| {
+            tracing::warn!(target: "x11::menu", "build: no X11 state snapshot; dismissing");
+            None
+        })?;
+        let (wx, wy) = self.place(&snap, place);
+        let win = self.conn.generate_id().ok()?;
+        let aux = CreateWindowAux::new()
+            .background_pixel(0)
+            .border_pixel(0)
+            .override_redirect(1)
+            .event_mask(EventMask::EXPOSURE)
+            .colormap(snap.colormap);
+        if self
+            .conn
+            .create_window(
+                snap.depth,
+                win,
+                snap.root,
+                wx as i16,
+                wy as i16,
+                place.pw.max(1) as u16,
+                place.ph.max(1) as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                snap.visual,
+                &aux,
+            )
+            .is_err()
+        {
+            tracing::error!(target: "x11::menu", "build: create_window failed");
+            return None;
+        }
+        let Ok(gc) = self.conn.generate_id() else {
+            let _ = self.conn.destroy_window(win);
+            return None;
+        };
+        let _ = self.conn.create_gc(gc, win, &CreateGCAux::new());
+        let _ = self.conn.map_window(win);
+        let _ = self
+            .conn
+            .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE));
+        // Round-trip on the grabbing connection before grabbing — the window
+        // must be realized server-side or the grab races into a BadWindow.
+        let _ = self
+            .conn
+            .get_geometry(win)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        tracing::debug!(target: "x11::menu", "build: window 0x{win:x} created+mapped");
+        Some(Window {
+            generation,
+            win,
+            gc,
+            buf: ShmBuffer::empty(),
+        })
+    }
+
+    fn place(&self, snap: &Snap, place: MenuPlacement) -> (i32, i32) {
+        let (w, h) = (place.pw.max(1), place.ph.max(1));
+        let mut x = snap.parent_x + (place.x as f32 * snap.scale).round() as i32;
+        let mut y = snap.parent_y + (place.y as f32 * snap.scale).round() as i32;
+        if x + w > snap.root_w {
+            x = (snap.root_w - w).max(0);
+        }
+        if y + h > snap.root_h {
+            let above = y - h;
+            y = if above >= 0 {
+                above
+            } else {
+                (snap.root_h - h).max(0)
+            };
+        }
+        (x.max(0), y.max(0))
+    }
+
+    fn reposition(&mut self, generation: Generation, place: MenuPlacement) {
+        if !self.owns(generation) {
+            return;
+        }
+        let Some(snap) = snapshot(&self.conn) else {
+            return;
+        };
+        let (wx, wy) = self.place(&snap, place);
+        let Some(window) = self.phase.window() else {
+            return;
+        };
+        let _ = self.conn.configure_window(
+            window.win,
+            &ConfigureWindowAux::new()
+                .x(wx)
+                .y(wy)
+                .width(place.pw.max(1) as u32)
+                .height(place.ph.max(1) as u32),
+        );
+        let _ = self.conn.flush();
+    }
+
+    fn present(&mut self, paint: MenuPaint) {
+        if !self.owns(paint.generation) {
+            return;
+        }
+        let conn = Arc::clone(&self.conn);
+        let Some(window) = self.phase.window() else {
+            return;
+        };
+        let (w, h) = (paint.pw.max(1), paint.ph.max(1));
+        if !shm_alloc(&mut window.buf, &conn, w, h) {
+            return;
+        }
+        let pixels = window.buf.pixels_mut();
+        let len = pixels.len().min(paint.pixels.len());
+        pixels[..len].copy_from_slice(&paint.pixels[..len]);
+        let _ = conn.shm_put_image(
+            window.win,
+            window.gc,
+            w as u16,
+            h as u16,
+            0,
+            0,
+            w as u16,
+            h as u16,
+            0,
+            0,
+            32,
+            u8::from(ImageFormat::Z_PIXMAP),
+            false,
+            window.buf.seg(),
+            0,
+        );
+        let _ = conn.flush();
+    }
+
+    fn on_grab_retry(&mut self) -> TimeoutAction {
+        let Phase::Grabbing { window, attempts } = &mut self.phase else {
+            return TimeoutAction::Drop;
+        };
+        let generation = window.generation;
+        if grab_pointer(&self.conn, window.win) {
+            let _ = self.conn.grab_keyboard(
+                false,
+                window.win,
+                x11rb::CURRENT_TIME,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            );
+            let Phase::Grabbing { window, .. } = std::mem::replace(&mut self.phase, Phase::Idle)
+            else {
+                return TimeoutAction::Drop;
+            };
+            self.phase = Phase::Open(window);
+            tracing::debug!(target: "x11::menu", "grab: menu is modal");
+            host().on_ready(generation);
+            return TimeoutAction::Drop;
+        }
+        *attempts += 1;
+        if *attempts >= GRAB_ATTEMPTS {
+            tracing::error!(target: "x11::menu", "grab: pointer grab failed; dismissing");
+            self.tear_down();
+            host().on_done(generation);
+            return TimeoutAction::Drop;
+        }
+        TimeoutAction::ToDuration(GRAB_RETRY)
+    }
+
+    fn on_event(&mut self, ev: Event) {
+        if !matches!(self.phase, Phase::Open(_)) {
+            return;
+        }
+        match ev {
+            Event::Expose(_) => host().expose(),
+            Event::MotionNotify(e) => host().motion(MenuPoint::Physical {
+                x: f32::from(e.event_x),
+                y: f32::from(e.event_y),
+            }),
+            Event::ButtonPress(e) => host().press(MenuPoint::Physical {
+                x: f32::from(e.event_x),
+                y: f32::from(e.event_y),
+            }),
+            Event::KeyPress(e) => host().key(self.keymap.lookup(e.detail)),
+            _ => {}
+        }
+    }
+
+    fn tear_down(&mut self) {
+        let (Phase::Grabbing { mut window, .. } | Phase::Open(mut window)) =
+            std::mem::replace(&mut self.phase, Phase::Idle)
+        else {
+            return;
+        };
+        let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+        shm_free(&mut window.buf, Some(&*self.conn));
+        let _ = self.conn.free_gc(window.gc);
+        let _ = self.conn.destroy_window(window.win);
+        let _ = self.conn.flush();
+        tracing::debug!(target: "x11::menu", "tear_down: window 0x{:x} gone", window.win);
     }
 }
 
@@ -99,23 +475,24 @@ struct Snap {
 }
 
 fn snapshot(conn: &RustConnection) -> Option<Snap> {
-    let g = MUT.lock();
-    let m = g.as_ref()?;
+    let host = crate::x11_state::host()?;
+    let paint = crate::x11_state::paint()?;
+    let parent = crate::x11_state::parent_snapshot();
     let screen = conn
         .setup()
         .roots
         .iter()
-        .find(|s| s.root == m.root)
+        .find(|s| s.root == host.root)
         .or_else(|| conn.setup().roots.first())?;
     Some(Snap {
-        visual: m.argb_visual,
-        depth: m.argb_depth,
-        colormap: m.colormap,
-        root: m.root,
-        parent_x: m.parent_x,
-        parent_y: m.parent_y,
-        scale: if m.cached_scale > 0.0 {
-            m.cached_scale
+        visual: paint.argb_visual,
+        depth: paint.argb_depth,
+        colormap: paint.colormap,
+        root: host.root,
+        parent_x: parent.origin_x,
+        parent_y: parent.origin_y,
+        scale: if parent.scale > 0.0 {
+            parent.scale
         } else {
             1.0
         },
@@ -124,262 +501,20 @@ fn snapshot(conn: &RustConnection) -> Option<Snap> {
     })
 }
 
-fn place(snap: &Snap, cx: i32, cy: i32, w: i32, h: i32) -> (i32, i32) {
-    let mut x = snap.parent_x + (cx as f32 * snap.scale).round() as i32;
-    let mut y = snap.parent_y + (cy as f32 * snap.scale).round() as i32;
-    if x + w > snap.root_w {
-        x = (snap.root_w - w).max(0);
-    }
-    if y + h > snap.root_h {
-        let above = y - h;
-        y = if above >= 0 {
-            above
-        } else {
-            (snap.root_h - h).max(0)
-        };
-    }
-    (x.max(0), y.max(0))
-}
-
-fn close(life: &mut Life, ev: LifeEvent) -> i32 {
-    lifecycle_fsm::step(life, &ev)
-        .into_iter()
-        .find_map(|e| match e {
-            LifeEffect::Fire(id) => Some(id),
-            _ => None,
-        })
-        .unwrap_or(-1)
-}
-
-fn run_menu(conn: &RustConnection, keymap: &Keymap, fonts: &mut Fonts, req: &MenuRequest) -> i32 {
-    let mut life = Life::default();
-    let _ = lifecycle_fsm::step(&mut life, &LifeEvent::Show);
-
-    let Some(snap) = snapshot(conn) else {
-        tracing::warn!(target: "x11::menu", "run_menu: no X11 state snapshot; dismissing");
-        return close(&mut life, LifeEvent::BuildFail);
-    };
-    let layout = render::layout(fonts, &req.items, snap.scale);
-    if layout.selectable.is_empty() {
-        tracing::debug!(target: "x11::menu", "run_menu: no selectable rows; dismissing");
-        return close(&mut life, LifeEvent::BuildFail);
-    }
-    let (wx, wy) = place(&snap, req.x, req.y, layout.width, layout.height);
-    tracing::debug!(
-        target: "x11::menu",
-        "run_menu: scale={:.2} parent=({},{}) root={}x{} menu={}x{} at=({},{})",
-        snap.scale, snap.parent_x, snap.parent_y, snap.root_w, snap.root_h,
-        layout.width, layout.height, wx, wy,
-    );
-
-    let Ok(win) = conn.generate_id() else {
-        return close(&mut life, LifeEvent::BuildFail);
-    };
-    let aux = CreateWindowAux::new()
-        .background_pixel(0)
-        .border_pixel(0)
-        .override_redirect(1)
-        .event_mask(EventMask::EXPOSURE)
-        .colormap(snap.colormap);
-    if conn
-        .create_window(
-            snap.depth,
-            win,
-            snap.root,
-            wx as i16,
-            wy as i16,
-            layout.width as u16,
-            layout.height as u16,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            snap.visual,
-            &aux,
-        )
-        .is_err()
-    {
-        tracing::error!(target: "x11::menu", "run_menu: create_window failed");
-        return close(&mut life, LifeEvent::BuildFail);
-    }
-    tracing::debug!(target: "x11::menu", "run_menu: window 0x{win:x} created+mapped");
-
-    let Ok(gc) = conn.generate_id() else {
-        let _ = conn.destroy_window(win);
-        return close(&mut life, LifeEvent::BuildFail);
-    };
-    let _ = conn.create_gc(gc, win, &CreateGCAux::new());
-    let _ = conn.map_window(win);
-    let _ = conn.configure_window(
-        win,
-        &x11rb::protocol::xproto::ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-    );
-    // Round-trip on the grabbing connection before grabbing — the window must
-    // be realized server-side or the grab races into a BadWindow.
-    let _ = conn.get_geometry(win).ok().and_then(|c| c.reply().ok());
-
-    let mut buf = ShmBuffer::empty();
-    redraw(conn, win, gc, &mut buf, fonts, &layout, &req.items, -1);
-    let _ = lifecycle_fsm::step(&mut life, &LifeEvent::BuildOk);
-
-    if !grab(conn, win) {
-        tracing::error!(target: "x11::menu", "run_menu: pointer grab failed; dismissing");
-        let result = close(&mut life, LifeEvent::GrabFail);
-        cleanup(conn, win, gc, &mut buf);
-        return result;
-    }
-    let _ = lifecycle_fsm::step(&mut life, &LifeEvent::GrabOk);
-    tracing::debug!(target: "x11::menu", "run_menu: grabbed; entering modal loop");
-
-    let result = event_loop(conn, keymap, win, gc, &mut buf, fonts, &layout, &req.items);
-
-    let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
-    let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
-    let result = close(&mut life, LifeEvent::Result(result));
-    cleanup(conn, win, gc, &mut buf);
-    result
-}
-
-fn translate(keymap: &Keymap, ev: &Event) -> Option<MenuEvent> {
-    match ev {
-        Event::Expose(_) => Some(MenuEvent::Expose),
-        Event::MotionNotify(e) => Some(MenuEvent::Motion {
-            x: e.event_x as i32,
-            y: e.event_y as i32,
-        }),
-        Event::ButtonPress(e) => Some(MenuEvent::Press {
-            x: e.event_x as i32,
-            y: e.event_y as i32,
-        }),
-        Event::KeyPress(e) => Some(MenuEvent::Key(keymap.lookup(e.detail))),
-        _ => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn event_loop(
-    conn: &RustConnection,
-    keymap: &Keymap,
-    win: u32,
-    gc: u32,
-    buf: &mut ShmBuffer,
-    fonts: &mut Fonts,
-    layout: &Layout,
-    items: &[MenuItem],
-) -> i32 {
-    let mut state = MenuState::default();
-    loop {
-        let Ok(ev) = conn.wait_for_event() else {
-            return -1;
-        };
-        let Some(mev) = translate(keymap, &ev) else {
-            continue;
-        };
-        for effect in interaction_fsm::step(&mut state, &mev, layout, items) {
-            match effect {
-                MenuEffect::Redraw => {
-                    redraw(conn, win, gc, buf, fonts, layout, items, state.active);
-                }
-                MenuEffect::Close(id) => return id,
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn redraw(
-    conn: &RustConnection,
-    win: u32,
-    gc: u32,
-    buf: &mut ShmBuffer,
-    fonts: &mut Fonts,
-    layout: &Layout,
-    items: &[MenuItem],
-    active: i32,
-) {
-    let Some(pm) = render::paint(fonts, layout, items, active) else {
-        return;
-    };
-    let w = layout.width;
-    let h = layout.height;
-    if !shm_alloc(buf, conn, w, h) {
-        return;
-    }
-    // tiny-skia is premultiplied RGBA; the ARGB32 X visual wants premultiplied
-    // BGRA, so swap R and B as we copy into the SHM segment.
-    let src = pm.data();
-    let dst = unsafe { std::slice::from_raw_parts_mut(buf.data, (w * h * 4) as usize) };
-    let mut i = 0;
-    while i + 3 < src.len() && i + 3 < dst.len() {
-        dst[i] = src[i + 2];
-        dst[i + 1] = src[i + 1];
-        dst[i + 2] = src[i];
-        dst[i + 3] = src[i + 3];
-        i += 4;
-    }
-    let _ = conn.shm_put_image(
-        win,
-        gc,
-        w as u16,
-        h as u16,
-        0,
-        0,
-        w as u16,
-        h as u16,
-        0,
-        0,
-        32,
-        u8::from(ImageFormat::Z_PIXMAP),
+fn grab_pointer(conn: &RustConnection, win: u32) -> bool {
+    conn.grab_pointer(
         false,
-        buf.seg,
-        0,
-    );
-    let _ = conn.flush();
-}
-
-fn grab(conn: &RustConnection, win: u32) -> bool {
-    let mut got_pointer = false;
-    for _ in 0..40 {
-        let ok = conn
-            .grab_pointer(
-                false,
-                win,
-                EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
-                GrabMode::ASYNC,
-                GrabMode::ASYNC,
-                x11rb::NONE,
-                x11rb::NONE,
-                x11rb::CURRENT_TIME,
-            )
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| r.status == GrabStatus::SUCCESS)
-            .unwrap_or(false);
-        if ok {
-            got_pointer = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    if !got_pointer {
-        return false;
-    }
-    let _ = conn
-        .grab_keyboard(
-            false,
-            win,
-            x11rb::CURRENT_TIME,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        )
-        .ok()
-        .and_then(|c| c.reply().ok());
-    true
-}
-
-fn cleanup(conn: &RustConnection, win: u32, gc: u32, buf: &mut ShmBuffer) {
-    shm_free(buf, Some(conn));
-    let _ = conn.free_gc(gc);
-    let _ = conn.destroy_window(win);
-    let _ = conn.flush();
+        win,
+        EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+        GrabMode::ASYNC,
+        GrabMode::ASYNC,
+        x11rb::NONE,
+        x11rb::NONE,
+        x11rb::CURRENT_TIME,
+    )
+    .ok()
+    .and_then(|c| c.reply().ok())
+    .is_some_and(|r| r.status == GrabStatus::SUCCESS)
 }
 
 struct Keymap {

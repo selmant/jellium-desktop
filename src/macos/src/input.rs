@@ -13,14 +13,14 @@ use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool, Sel};
-use objc2::{AnyThread, DefinedClass, define_class, extern_class, msg_send, sel};
+use objc2::runtime::{AnyObject, Bool};
+use objc2::{AnyThread, DefinedClass, define_class, extern_class, msg_send};
+use objc2_app_kit::NSCursor;
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
 
 // =====================================================================
-// NSView shim — objc2 has no built-in `NSView` binding without
-// `objc2-app-kit` (heavy dep). Declare it as an extern class so
-// `define_class!(super(NSView))` resolves.
+// NSView shim — `define_class!(super(NSView))` needs an `AnyThread`
+// superclass; objc2-app-kit's NSView is main-thread-only.
 // =====================================================================
 
 extern_class!(
@@ -70,19 +70,7 @@ use jfn_input::{
     jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll_precise,
 };
 
-unsafe extern "C" {
-    static _dispatch_main_q: c_void;
-    fn dispatch_async_f(
-        queue: *mut c_void,
-        ctx: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
-}
-
-#[inline]
-fn dispatch_get_main_queue() -> *mut c_void {
-    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
-}
+use crate::dispatch::post_to_main;
 
 // =====================================================================
 // Modifier / key translation
@@ -210,69 +198,56 @@ static G_PENDING_CURSOR: AtomicI32 = AtomicI32::new(CursorShape::Pointer.as_raw(
 /// held during drags). Touched only from the main thread.
 static G_MOUSE_BUTTON_MODIFIERS: AtomicU32 = AtomicU32::new(0);
 
-unsafe fn ns_cursor_for(shape: CursorShape) -> *mut AnyObject {
+/// AppKit exposes no non-deprecated directional resize cursors; CEF's
+/// cursor set maps onto these.
+#[allow(deprecated)]
+fn ns_cursor_for(shape: CursorShape) -> Retained<NSCursor> {
     use CursorShape::*;
-    let cls = objc2::class!(NSCursor);
-    let sel: Sel = match shape {
-        Cross => sel!(crosshairCursor),
-        Hand => sel!(pointingHandCursor),
-        IBeam => sel!(IBeamCursor),
-        VerticalText => sel!(IBeamCursorForVerticalLayout),
-        EastResize => sel!(resizeRightCursor),
-        WestResize => sel!(resizeLeftCursor),
-        NorthResize => sel!(resizeUpCursor),
-        SouthResize => sel!(resizeDownCursor),
-        NorthSouthResize | RowResize => sel!(resizeUpDownCursor),
-        EastWestResize | ColumnResize => sel!(resizeLeftRightCursor),
-        Move | Grab => sel!(openHandCursor),
-        Grabbing => sel!(closedHandCursor),
-        NoDrop | NotAllowed => sel!(operationNotAllowedCursor),
-        Copy => sel!(dragCopyCursor),
-        Alias => sel!(dragLinkCursor),
-        ContextMenu => sel!(contextualMenuCursor),
-        _ => sel!(arrowCursor),
-    };
-    unsafe { msg_send![cls, performSelector: sel] }
+    match shape {
+        Cross => NSCursor::crosshairCursor(),
+        Hand => NSCursor::pointingHandCursor(),
+        IBeam => NSCursor::IBeamCursor(),
+        VerticalText => NSCursor::IBeamCursorForVerticalLayout(),
+        EastResize => NSCursor::resizeRightCursor(),
+        WestResize => NSCursor::resizeLeftCursor(),
+        NorthResize => NSCursor::resizeUpCursor(),
+        SouthResize => NSCursor::resizeDownCursor(),
+        NorthSouthResize | RowResize => NSCursor::resizeUpDownCursor(),
+        EastWestResize | ColumnResize => NSCursor::resizeLeftRightCursor(),
+        Move | Grab => NSCursor::openHandCursor(),
+        Grabbing => NSCursor::closedHandCursor(),
+        NoDrop | NotAllowed => NSCursor::operationNotAllowedCursor(),
+        Copy => NSCursor::dragCopyCursor(),
+        Alias => NSCursor::dragLinkCursor(),
+        ContextMenu => NSCursor::contextualMenuCursor(),
+        _ => NSCursor::arrowCursor(),
+    }
 }
 
-unsafe fn apply_cursor_state() {
+fn apply_cursor_state() {
     let pending = CursorShape::from_cef(G_PENDING_CURSOR.load(Ordering::SeqCst))
         .unwrap_or(CursorShape::Pointer);
     let inside = G_MOUSE_INSIDE.load(Ordering::SeqCst);
-    let cls = objc2::class!(NSCursor);
     if pending == CursorShape::None && inside {
         if !G_CURSOR_HIDDEN.load(Ordering::SeqCst) {
-            let _: () = unsafe { msg_send![cls, hide] };
+            NSCursor::hide();
             G_CURSOR_HIDDEN.store(true, Ordering::SeqCst);
         }
     } else {
         if G_CURSOR_HIDDEN.load(Ordering::SeqCst) {
-            let _: () = unsafe { msg_send![cls, unhide] };
+            NSCursor::unhide();
             G_CURSOR_HIDDEN.store(false, Ordering::SeqCst);
         }
         if inside && pending != CursorShape::None {
-            let cur = unsafe { ns_cursor_for(pending) };
-            if !cur.is_null() {
-                let _: () = unsafe { msg_send![cur, set] };
-            }
+            ns_cursor_for(pending).set();
         }
     }
-}
-
-unsafe extern "C" fn cursor_trampoline(_ctx: *mut c_void) {
-    unsafe { apply_cursor_state() };
 }
 
 /// Platform::set_cursor — safe to call from any thread.
 pub fn jfn_input_macos_set_cursor(t: c_int) {
     G_PENDING_CURSOR.store(t, Ordering::SeqCst);
-    unsafe {
-        dispatch_async_f(
-            dispatch_get_main_queue(),
-            std::ptr::null_mut(),
-            cursor_trampoline,
-        );
-    }
+    post_to_main(apply_cursor_state);
 }
 
 // =====================================================================
@@ -281,10 +256,6 @@ pub fn jfn_input_macos_set_cursor(t: c_int) {
 // =====================================================================
 
 static SCROLL: Mutex<ScrollAccum> = Mutex::new(ScrollAccum::new());
-
-unsafe extern "C" fn scroll_flush_trampoline(_ctx: *mut c_void) {
-    flush_scroll_accumulator();
-}
 
 fn flush_scroll_accumulator() {
     let flush = SCROLL.lock().flush();
@@ -414,13 +385,13 @@ define_class!(
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, event: &AnyObject) {
             G_MOUSE_INSIDE.store(true, Ordering::SeqCst);
-            unsafe { apply_cursor_state() };
+            apply_cursor_state();
             dispatch_mouse_move(self, event, false);
         }
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, event: &AnyObject) {
             G_MOUSE_INSIDE.store(false, Ordering::SeqCst);
-            unsafe { apply_cursor_state() };
+            apply_cursor_state();
             dispatch_mouse_move(self, event, true);
         }
 
@@ -451,13 +422,7 @@ define_class!(
                 delta_y,
             );
             if sched {
-                unsafe {
-                    dispatch_async_f(
-                        dispatch_get_main_queue(),
-                        std::ptr::null_mut(),
-                        scroll_flush_trampoline,
-                    );
-                }
+                post_to_main(flush_scroll_accumulator);
             }
         }
 

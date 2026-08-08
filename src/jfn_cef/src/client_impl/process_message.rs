@@ -2,7 +2,7 @@ use cef::{Browser, ImplListValue, ImplProcessMessage, ProcessMessage};
 use std::os::raw::c_int;
 use std::sync::Arc;
 
-use crate::app::userfree_to_string;
+use crate::cef_string::userfree_to_string;
 use crate::client::Inner;
 use crate::ipc::BrowserMessage;
 
@@ -40,18 +40,6 @@ pub(super) fn on_process_message_received(
                 };
                 let anchor = (args.int(5) != 0).then(|| (args.int(3), args.int(4)));
                 inner.set_popup_options(opts, selected, selectable, anchor);
-            }
-            1
-        }
-        "menuItemSelected" => {
-            if let Some(cb) = inner.take_parked_menu_selection() {
-                cb(args.map_or(-1, |a| a.int(0)));
-            }
-            1
-        }
-        "menuDismissed" => {
-            if let Some(cb) = inner.take_parked_menu_selection() {
-                cb(-1);
             }
             1
         }

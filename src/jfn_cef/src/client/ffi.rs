@@ -268,11 +268,13 @@ fn zoom_from_wheel(inner: Arc<Inner>, modifiers: u32, dy: c_int) -> bool {
 }
 
 pub(crate) unsafe fn jfn_cef_layer_set_surface(h: *const JfnCefLayer, s: *mut c_void) {
-    *unsafe { arc(h) }.surface.lock() = s;
+    unsafe { arc(h) }
+        .surface
+        .store(jfn_platform_abi::SurfaceHandle::from_ptr(s));
 }
 
 pub(crate) unsafe fn jfn_cef_layer_get_surface(h: *const JfnCefLayer) -> *mut c_void {
-    unsafe { arc(h) }.surface_ptr()
+    unsafe { arc(h) }.surface_handle().as_ptr()
 }
 
 pub(crate) unsafe fn jfn_cef_layer_resize(

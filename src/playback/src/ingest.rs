@@ -9,11 +9,11 @@
 //! lives in [`IngestState`] so multiple
 //! ingest calls observe the same change-suppression behavior.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use crossbeam_utils::atomic::AtomicCell;
 use jfn_mpv::{Event, ObserveId, PropertyValue};
 use jfn_platform_abi::{LogicalSize, PhysicalSize, Scale, WindowExtent};
-use parking_lot::Mutex;
 
 use crate::coordinator::Input;
 use crate::types::{EndReason, PlaybackBufferedRange};
@@ -34,6 +34,7 @@ pub mod observe_id {
     pub const PAUSED_FOR_CACHE: u64 = 13;
     pub const CORE_IDLE: u64 = 14;
     pub const VIDEO_FRAME_INFO: u64 = 15;
+    pub const WINDOW_ID: u64 = 16;
 }
 
 const MAX_BUFFERED_RANGES: usize = 8;
@@ -82,10 +83,11 @@ pub struct IngestState {
     window_maximized: AtomicBool,
     /// Last known window extent, written whole by the osd-dimensions
     /// digest.
-    extent: Mutex<Option<WindowExtent>>,
-    /// `f64` bit pattern stored as `u64` — `AtomicF64` isn't stable.
-    display_scale_bits: AtomicU64,
-    display_hz_bits: AtomicU64,
+    extent: AtomicCell<Option<WindowExtent>>,
+    display_scale: AtomicCell<f64>,
+    display_hz: AtomicCell<f64>,
+    /// mpv's native window handle; `0` until the VO has a window.
+    window_id: AtomicI64,
 }
 
 impl IngestState {
@@ -100,16 +102,22 @@ impl IngestState {
         self.window_maximized.load(Ordering::Relaxed)
     }
     pub fn window_extent(&self) -> Option<WindowExtent> {
-        *self.extent.lock()
+        self.extent.load()
     }
     pub fn display_scale(&self) -> f64 {
-        f64::from_bits(self.display_scale_bits.load(Ordering::Relaxed))
+        self.display_scale.load()
     }
     pub fn display_hz(&self) -> f64 {
-        f64::from_bits(self.display_hz_bits.load(Ordering::Relaxed))
+        self.display_hz.load()
     }
     pub fn set_display_hz(&self, hz: f64) {
-        self.display_hz_bits.store(hz.to_bits(), Ordering::Relaxed);
+        self.display_hz.store(hz);
+    }
+    /// mpv's native window handle as last reported by `window-id`; `None`
+    /// until mpv's VO has a window.
+    pub fn window_id(&self) -> Option<i64> {
+        let id = self.window_id.load(Ordering::Relaxed);
+        (id != 0).then_some(id)
     }
 }
 
@@ -213,6 +221,12 @@ fn digest_property<C: IngestCtx>(
             value,
             PropertyValue::None
         )))],
+        WINDOW_ID => {
+            if let Some(id) = as_int(value) {
+                state.window_id.store(id, Ordering::Relaxed);
+            }
+            Vec::new()
+        }
         WINDOW_MAX => {
             if let Some(f) = as_flag(value) {
                 state.window_maximized.store(f, Ordering::Relaxed);
@@ -223,16 +237,15 @@ fn digest_property<C: IngestCtx>(
             let Some(new_scale) = as_double(value) else {
                 return Vec::new();
             };
-            let old_bits = state
-                .display_scale_bits
-                .swap(new_scale.to_bits(), Ordering::Relaxed);
-            if f64::from_bits(old_bits) == new_scale {
+            if state.display_scale.swap(new_scale) == new_scale {
                 return Vec::new();
             }
-            let mut extent = state.extent.lock();
-            match *extent {
+            match state.extent.load() {
                 Some(e) => {
-                    *extent = Some(WindowExtent::new(e.physical(), Scale(new_scale as f32)));
+                    state.extent.store(Some(WindowExtent::new(
+                        e.physical(),
+                        Scale(new_scale as f32),
+                    )));
                     vec![IngestOut::WindowExtentChanged]
                 }
                 None => Vec::new(),
@@ -242,14 +255,11 @@ fn digest_property<C: IngestCtx>(
             let Some(fps) = as_double(value) else {
                 return Vec::new();
             };
-            if fps != state.display_hz() {
-                state
-                    .display_hz_bits
-                    .store(fps.to_bits(), Ordering::Relaxed);
-                vec![IngestOut::Input(Input::DisplayHz(fps))]
-            } else {
-                Vec::new()
+            if fps == state.display_hz() {
+                return Vec::new();
             }
+            state.display_hz.store(fps);
+            vec![IngestOut::Input(Input::DisplayHz(fps))]
         }
         CACHE_STATE => digest_cache_state(value),
         _ => Vec::new(),
@@ -289,11 +299,11 @@ fn digest_osd_dims<C: IngestCtx>(
     if lw <= 0 || lh <= 0 {
         return Vec::new();
     }
-    *state.extent.lock() = Some(WindowExtent::with_logical(
+    state.extent.store(Some(WindowExtent::with_logical(
         PhysicalSize { w: pw, h: ph },
         Scale(scale),
         LogicalSize { w: lw, h: lh },
-    ));
+    )));
     vec![IngestOut::WindowExtentChanged]
 }
 
@@ -322,6 +332,14 @@ fn digest_cache_state(value: &PropertyValue) -> Vec<IngestOut> {
 fn as_flag(v: &PropertyValue) -> Option<bool> {
     if let PropertyValue::Flag(f) = v {
         Some(*f)
+    } else {
+        None
+    }
+}
+
+fn as_int(v: &PropertyValue) -> Option<i64> {
+    if let PropertyValue::Int(i) = v {
+        Some(*i)
     } else {
         None
     }

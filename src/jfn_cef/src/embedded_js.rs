@@ -11,7 +11,6 @@ pub fn get(name: &str) -> Option<&'static str> {
         "jellyfin-session.js" => include_str!("../../web/jellyfin-session.js"),
         #[cfg(feature = "external-frontend")]
         "external-host.js" => include_str!("../../web/external-host.js"),
-        "context-menu.js" => include_str!("../../web/context-menu.js"),
         "csd.js" => include_str!("../../web/csd.js"),
         "select-menu.js" => include_str!("../../web/select-menu.js"),
         _ => return None,

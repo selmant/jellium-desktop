@@ -41,11 +41,11 @@ impl Inner {
 
     pub(crate) fn on_load_end(&self, is_main: bool, code: c_int, url: &str) {
         let formatted = format!(
-            "CefLayer::OnLoadEnd name={} main={} code={} url_present={}",
+            "CefLayer::OnLoadEnd name={} main={} code={} url={}",
             self.name_str(),
             if is_main { 1 } else { 0 },
             code,
-            !url.is_empty(),
+            url,
         );
         jfn_logging::log(
             jfn_logging::CATEGORY_CEF,
@@ -57,17 +57,13 @@ impl Inner {
             self.loaded.store(true, Ordering::Release);
             self.load_cv.notify_all();
         }
-        #[cfg(feature = "external-frontend")]
-        if is_main && self.name_str() == "web" && (200..400).contains(&code) {
-            crate::business_external::jfn_external_on_web_load(url);
-        }
     }
 
     pub(crate) fn on_load_error(&self, code: c_int, text: &str, url: &str) {
         let formatted = format!(
-            "OnLoadError name={} url_present={} error={} {}",
+            "OnLoadError name={} url={} error={} {}",
             self.name_str(),
-            !url.is_empty(),
+            url,
             code,
             text,
         );
@@ -82,20 +78,13 @@ impl Inner {
         if self.visible.swap(visible, Ordering::AcqRel) == visible {
             return;
         }
-        let surface = self.surface_ptr();
-        if surface.is_null() {
-            tracing::debug!(layer = %self.name_str(), visible, "deferred CEF layer visibility before surface creation");
+        let surface = self.surface_handle();
+        if surface.is_none() {
             return;
         }
-        tracing::debug!(layer = %self.name_str(), visible, "updating CEF layer visibility");
         if let Some(p) = platform_ops::ops() {
             p.surface_set_visible(surface, visible);
         }
-        // Per-layer visibility must mirror the whole-app hidden path. In
-        // particular, WasHidden(false) tells windowless CEF to produce a fresh
-        // frame immediately; without it a remapped GPU surface can expose the
-        // layer below until the page happens to paint again.
-        self.cef_was_hidden(!visible);
     }
 
     pub(crate) fn try_paste(self: &Arc<Self>) -> bool {
