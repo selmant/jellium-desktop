@@ -84,6 +84,9 @@ struct Mailbox {
     visible: bool,
     hide_pending: bool,
     viewport_dirty: bool,
+    /// A deferred resize remains dirty but must not spin the worker before a
+    /// frame arrives that can apply source and destination atomically.
+    viewport_deferred: bool,
     shutdown: bool,
     popup: PopupCommit,
 }
@@ -97,6 +100,7 @@ impl Mailbox {
             visible,
             hide_pending: false,
             viewport_dirty: false,
+            viewport_deferred: false,
             shutdown: false,
             popup: PopupCommit::Idle,
         }
@@ -119,12 +123,28 @@ impl Mailbox {
         }
         self.viewport = viewport;
         self.viewport_dirty = true;
+        self.viewport_deferred = false;
         self.shadow = ShadowState::Stale;
     }
 
     fn request_placeholder(&mut self, r: u8, g: u8, b: u8) {
         self.pending = Some(PendingFrame::Placeholder(r, g, b));
         self.shadow = ShadowState::Stale;
+    }
+
+    fn defer_viewport_until_frame(&mut self) {
+        if !self.viewport_dirty {
+            self.viewport_dirty = true;
+            self.viewport_deferred = true;
+        }
+    }
+
+    fn needs_worker_wake(&self) -> bool {
+        self.pending.is_some()
+            || self.shutdown
+            || self.hide_pending
+            || (self.viewport_dirty && !self.viewport_deferred)
+            || matches!(self.popup, PopupCommit::Queued(_))
     }
 
     fn present_dmabuf(&mut self, frame: JfnDmabufFrame) {
@@ -561,17 +581,13 @@ fn run(
         ) = {
             let (lock, cv) = &*shared;
             let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
-            while state.pending.is_none()
-                && !state.shutdown
-                && !state.hide_pending
-                && !state.viewport_dirty
-                && !matches!(state.popup, PopupCommit::Queued(_))
-            {
+            while !state.needs_worker_wake() {
                 state = cv.wait(state).unwrap_or_else(PoisonError::into_inner);
             }
             state.hide_pending = false;
             let viewport_dirty = state.viewport_dirty;
             state.viewport_dirty = false;
+            state.viewport_deferred = false;
             let popup_commit = if let PopupCommit::Queued(popup) =
                 std::mem::replace(&mut state.popup, PopupCommit::InFlight)
             {
@@ -640,11 +656,17 @@ fn run(
                 }
             },
             Action::ReapplyViewport => {
-                // Zero source args leave the latched source untouched; only the
-                // destination is rescaled to the new logical size.
-                layer.set_viewport(0, 0, viewport.lw, viewport.lh);
-                layer.commit();
-                true
+                // A resize cannot safely update just the destination: the
+                // source belongs to the attached buffer and may no longer fit.
+                // Defer source+destination to the next present(), which sets
+                // both with its compatible buffer. A co-pending popup still
+                // needs a bare layer commit to fold its cached state; that
+                // preserves the last valid viewport instead of committing a
+                // fabricated 1x1 source.
+                if popup_commit.is_some() {
+                    layer.commit();
+                }
+                popup_commit.is_some()
             }
             Action::BareCommit => {
                 layer.commit();
@@ -664,11 +686,9 @@ fn run(
         if visible && !layer_committed {
             match reconcile(viewport_dirty, popup_commit.is_some()) {
                 Reconcile::ReapplyViewport => {
-                    // Zero source args leave the latched source untouched; only
-                    // the destination is rescaled to the new logical size.
-                    layer.set_viewport(0, 0, viewport.lw, viewport.lh);
-                    layer.commit();
-                    layer_committed = true;
+                    // The next frame owns the compatible source+destination
+                    // transaction. Keep the resize dirty below instead of
+                    // committing a destination against a stale source.
                 }
                 Reconcile::BareCommit => {
                     layer.commit();
@@ -676,6 +696,15 @@ fn run(
                 }
                 Reconcile::None => {}
             }
+        }
+
+        // A popup-only commit preserves the old valid viewport, but does not
+        // apply this resize. Retain it without waking ourselves: the next
+        // pending frame will apply both source and destination atomically.
+        if viewport_dirty && !present_committed {
+            let (lock, _) = &*shared;
+            let mut state = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            state.defer_viewport_until_frame();
         }
 
         if layer_committed || popup_commit.is_some() {
@@ -1296,6 +1325,29 @@ mod tests {
         });
         assert!(mb.viewport_dirty);
         assert!(matches!(mb.shadow, ShadowState::Stale));
+    }
+
+    #[test]
+    fn popup_reapply_without_a_frame_keeps_resize_dirty_but_does_not_spin() {
+        let mut mb = Mailbox::new(vp(), true);
+        mb.resize(ViewportState {
+            lw: 200,
+            lh: 200,
+            pw: 200,
+            ph: 200,
+        });
+        assert!(mb.needs_worker_wake());
+
+        // Model the actor taking the dirty snapshot, committing only a popup,
+        // and finding no frame with which to atomically update the viewport.
+        mb.viewport_dirty = false;
+        mb.defer_viewport_until_frame();
+        assert!(mb.viewport_dirty);
+        assert!(mb.viewport_deferred);
+        assert!(!mb.needs_worker_wake());
+
+        mb.request_placeholder(0, 0, 0);
+        assert!(mb.needs_worker_wake());
     }
 
     #[test]

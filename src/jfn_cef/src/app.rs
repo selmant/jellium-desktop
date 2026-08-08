@@ -564,6 +564,17 @@ fn run_user_scripts(profile: &ExtraInfo, frame: &Frame) {
         &jfn_config::cli_json(jfn_mpv::hwdec_options()),
     );
     replace_first(&mut code, "__APP_VERSION__", crate::APP_VERSION);
+    let host_version = std::env::var("JELLIUM_DESKTOP_HOST_VERSION")
+        .ok()
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 128
+                && version.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-' | b'_')
+                })
+        })
+        .unwrap_or_else(|| crate::APP_VERSION.to_string());
+    replace_first(&mut code, "__HOST_VERSION__", &host_version);
     let decoration_options = profile
         .window_decoration_options()
         .iter()

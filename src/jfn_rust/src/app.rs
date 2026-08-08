@@ -77,6 +77,12 @@ fn init_logging(log_file: Option<String>, log_level: &str) {
     jfn_logging::jfn_log_init(&log_path, &filter);
 
     tracing::info!(target: "Main", "jellium-desktop {APP_VERSION_FULL}");
+    if let Ok(host_version) = std::env::var("JELLIUM_DESKTOP_HOST_VERSION") {
+        tracing::info!(target: "Main", host_version, "embedding host package version");
+    }
+    if let Ok(jellium_revision) = std::env::var("JELLIUM_DESKTOP_HOST_JELLIUM_REVISION") {
+        tracing::info!(target: "Main", jellium_revision, "embedding host pinned Jellium revision");
+    }
     tracing::info!(target: "Main", "CEF {}", cef_version());
     if !log_path.is_empty() {
         tracing::info!(target: "Main", "Log file: {log_path}");
@@ -579,7 +585,9 @@ fn init_main_browser(
             main_layer,
             frontend.start_url(),
             frontend.allowed_origin(),
+            frontend.is_setup_document(),
             host_options.auth_service(),
+            host_options.config_service(),
         );
     }
 

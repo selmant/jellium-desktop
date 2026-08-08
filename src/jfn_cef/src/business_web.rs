@@ -266,6 +266,9 @@ fn handle_player_load(args: &ListValue) {
 
     // Atomic pre-load posts so MPRIS/JS see start position before
     // mpv has opened the file.
+    #[cfg(feature = "external-frontend")]
+    crate::business_external::jfn_external_notify_load_starting();
+
     pb_post(PbInput::LoadStarting(meta.id.clone()));
     pb_post(PbInput::Position(start_ms as i64 * 1000));
 

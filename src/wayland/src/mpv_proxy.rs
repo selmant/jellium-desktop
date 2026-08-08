@@ -10,10 +10,11 @@
 //! override) and pass it explicitly via `with_server_display_name`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::os::raw::c_char;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -25,6 +26,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use parking_lot::Mutex;
 use wl_proxy::baseline::Baseline;
 use wl_proxy::client::{Client, ClientHandler};
+use wl_proxy::fixed::Fixed;
 use wl_proxy::object::{ConcreteObject, Object, ObjectCoreApi, ObjectError, ObjectRcUtils};
 use wl_proxy::protocols::ObjectInterface;
 use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1::{
@@ -33,19 +35,28 @@ use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_manager_v1::{
 use wl_proxy::protocols::fractional_scale_v1::wp_fractional_scale_v1::{
     WpFractionalScaleV1, WpFractionalScaleV1Handler,
 };
+use wl_proxy::protocols::linux_dmabuf_v1::zwp_linux_buffer_params_v1::{
+    ZwpLinuxBufferParamsV1, ZwpLinuxBufferParamsV1Flags, ZwpLinuxBufferParamsV1Handler,
+};
+use wl_proxy::protocols::linux_dmabuf_v1::zwp_linux_dmabuf_v1::{
+    ZwpLinuxDmabufV1, ZwpLinuxDmabufV1Handler,
+};
 use wl_proxy::protocols::viewporter::wp_viewport::{WpViewport, WpViewportHandler};
 use wl_proxy::protocols::viewporter::wp_viewporter::{WpViewporter, WpViewporterHandler};
+use wl_proxy::protocols::wayland::wl_buffer::{WlBuffer, WlBufferHandler};
 use wl_proxy::protocols::wayland::wl_callback::{WlCallback, WlCallbackHandler};
 use wl_proxy::protocols::wayland::wl_compositor::WlCompositor;
 use wl_proxy::protocols::wayland::wl_display::{WlDisplay, WlDisplayHandler};
 use wl_proxy::protocols::wayland::wl_keyboard::{
     WlKeyboard, WlKeyboardHandler, WlKeyboardKeyState,
 };
-use wl_proxy::protocols::wayland::wl_output::WlOutput;
+use wl_proxy::protocols::wayland::wl_output::{WlOutput, WlOutputTransform};
 use wl_proxy::protocols::wayland::wl_pointer::{WlPointer, WlPointerButtonState, WlPointerHandler};
 use wl_proxy::protocols::wayland::wl_region::WlRegion;
 use wl_proxy::protocols::wayland::wl_registry::{WlRegistry, WlRegistryHandler};
 use wl_proxy::protocols::wayland::wl_seat::{WlSeat, WlSeatHandler};
+use wl_proxy::protocols::wayland::wl_shm::{WlShm, WlShmHandler};
+use wl_proxy::protocols::wayland::wl_shm_pool::{WlShmPool, WlShmPoolHandler};
 use wl_proxy::protocols::wayland::wl_subcompositor::WlSubcompositor;
 use wl_proxy::protocols::wayland::wl_subsurface::WlSubsurface;
 use wl_proxy::protocols::wayland::wl_surface::{WlSurface, WlSurfaceHandler};
@@ -127,7 +138,7 @@ fn wake_mpv_thread() {
 }
 
 thread_local! {
-    static SHELL: RefCell<Shell> = const { RefCell::new(Shell::new()) };
+    static SHELL: RefCell<Shell> = RefCell::new(Shell::new());
 }
 
 struct Shell {
@@ -144,7 +155,252 @@ struct Shell {
     mpv_client: Option<Rc<Client>>,
     configurator: Option<MpvConfigurator>,
     mpv_subsurface: Option<SyncSubsurface>,
+    buffer_sizes: HashMap<u32, BufferSize>,
+    viewport_states: HashMap<u64, Rc<RefCell<MpvSurfaceState>>>,
     serial: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferSize {
+    width: i32,
+    height: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SurfaceGeometry {
+    scale: i32,
+    transform: WlOutputTransform,
+}
+
+impl Default for SurfaceGeometry {
+    fn default() -> Self {
+        Self {
+            scale: 1,
+            transform: WlOutputTransform::NORMAL,
+        }
+    }
+}
+
+impl SurfaceGeometry {
+    fn viewport_bounds(self, buffer: BufferSize) -> Option<ViewportBounds> {
+        let scale = i64::from(self.scale);
+        if scale <= 0 {
+            return None;
+        }
+        let (width, height) = if matches!(
+            self.transform,
+            WlOutputTransform::_90
+                | WlOutputTransform::_270
+                | WlOutputTransform::FLIPPED_90
+                | WlOutputTransform::FLIPPED_270
+        ) {
+            (buffer.height, buffer.width)
+        } else {
+            (buffer.width, buffer.height)
+        };
+        Some(ViewportBounds {
+            width: i64::from(width).saturating_mul(256) / scale,
+            height: i64::from(height).saturating_mul(256) / scale,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportBounds {
+    width: i64,
+    height: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Unset,
+    Crop {
+        x: Fixed,
+        y: Fixed,
+        width: Fixed,
+        height: Fixed,
+    },
+}
+
+impl Source {
+    fn from_request(x: Fixed, y: Fixed, width: Fixed, height: Fixed) -> Option<Self> {
+        let unset = Fixed::from_i32_saturating(-1);
+        if (x, y, width, height) == (unset, unset, unset, unset) {
+            return Some(Self::Unset);
+        }
+        (x >= Fixed::ZERO && y >= Fixed::ZERO && width > Fixed::ZERO && height > Fixed::ZERO)
+            .then_some(Self::Crop {
+                x,
+                y,
+                width,
+                height,
+            })
+    }
+
+    fn fits(self, bounds: ViewportBounds) -> bool {
+        let Self::Crop {
+            x,
+            y,
+            width,
+            height,
+        } = self
+        else {
+            return true;
+        };
+        let (x, y, width, height) = (
+            i64::from(x.to_wire()),
+            i64::from(y.to_wire()),
+            i64::from(width.to_wire()),
+            i64::from(height.to_wire()),
+        );
+        x >= 0
+            && y >= 0
+            && width > 0
+            && height > 0
+            && x.saturating_add(width) <= bounds.width
+            && y.saturating_add(height) <= bounds.height
+    }
+
+    /// Retain the requested visible origin and as much of its extent as the
+    /// attached buffer can safely provide. No intersection means no safe crop.
+    fn clamp_to(self, bounds: ViewportBounds) -> Option<Self> {
+        let Self::Crop {
+            x,
+            y,
+            width,
+            height,
+        } = self
+        else {
+            return Some(self);
+        };
+        let (x, y, width, height) = (
+            i64::from(x.to_wire()),
+            i64::from(y.to_wire()),
+            i64::from(width.to_wire()),
+            i64::from(height.to_wire()),
+        );
+        if x < 0 || y < 0 || width <= 0 || height <= 0 || x >= bounds.width || y >= bounds.height {
+            return None;
+        }
+        let width = width.min(bounds.width - x);
+        let height = height.min(bounds.height - y);
+        (width > 0 && height > 0).then_some(Self::Crop {
+            x: Fixed::from_wire(x as i32),
+            y: Fixed::from_wire(y as i32),
+            width: Fixed::from_wire(width as i32),
+            height: Fixed::from_wire(height as i32),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingBuffer {
+    Unchanged,
+    Detached,
+    Attached(Option<BufferSize>),
+}
+
+struct MpvSurfaceState {
+    viewport: Option<Weak<WpViewport>>,
+    spliced: bool,
+    current_buffer: Option<BufferSize>,
+    pending_buffer: PendingBuffer,
+    current_geometry: SurfaceGeometry,
+    pending_geometry: Option<SurfaceGeometry>,
+    requested_source: Source,
+    forwarded_source: Source,
+}
+
+impl Default for MpvSurfaceState {
+    fn default() -> Self {
+        Self {
+            viewport: None,
+            spliced: false,
+            current_buffer: None,
+            pending_buffer: PendingBuffer::Unchanged,
+            current_geometry: SurfaceGeometry::default(),
+            pending_geometry: None,
+            requested_source: Source::Unset,
+            forwarded_source: Source::Unset,
+        }
+    }
+}
+
+impl MpvSurfaceState {
+    fn attach(&mut self, buffer: Option<BufferSize>) {
+        self.pending_buffer = match buffer {
+            Some(size) => PendingBuffer::Attached(Some(size)),
+            None => PendingBuffer::Detached,
+        };
+    }
+
+    fn attach_unknown(&mut self) {
+        self.pending_buffer = PendingBuffer::Attached(None);
+    }
+
+    fn set_buffer_scale(&mut self, scale: i32) {
+        let mut geometry = self.pending_geometry.unwrap_or(self.current_geometry);
+        geometry.scale = scale;
+        self.pending_geometry = Some(geometry);
+    }
+
+    fn set_buffer_transform(&mut self, transform: WlOutputTransform) {
+        let mut geometry = self.pending_geometry.unwrap_or(self.current_geometry);
+        geometry.transform = transform;
+        self.pending_geometry = Some(geometry);
+    }
+
+    fn source_for_commit(&mut self) -> Option<Source> {
+        let buffer = match self.pending_buffer {
+            PendingBuffer::Unchanged => self.current_buffer,
+            PendingBuffer::Detached => None,
+            PendingBuffer::Attached(buffer) => buffer,
+        };
+        let geometry = self.pending_geometry.unwrap_or(self.current_geometry);
+        let bounds = buffer.and_then(|buffer| geometry.viewport_bounds(buffer));
+
+        let source = match (self.requested_source, bounds) {
+            (Source::Unset, _) => Some(Source::Unset),
+            (source, Some(bounds)) if source.fits(bounds) => Some(source),
+            (source, Some(bounds)) => source.clamp_to(bounds),
+            (_, None) => None,
+        };
+
+        // If an old crop would be invalid for a newly attached smaller buffer,
+        // clear it in the same transaction. The desired crop remains deferred
+        // and is retried when a compatible buffer arrives.
+        let forwarded = source.or_else(|| match self.pending_buffer {
+            // We cannot prove an old crop fits an unknown replacement buffer.
+            // Clear it in this transaction, retaining requested_source to retry
+            // once a buffer factory provides dimensions.
+            PendingBuffer::Attached(None) if self.forwarded_source != Source::Unset => {
+                Some(Source::Unset)
+            }
+            _ => bounds
+                .filter(|bounds| !self.forwarded_source.fits(*bounds))
+                .map(|_| Source::Unset),
+        });
+        if let Some(source) = forwarded {
+            if source == self.forwarded_source {
+                return None;
+            }
+            self.forwarded_source = source;
+            return Some(source);
+        }
+        None
+    }
+
+    fn committed(&mut self) {
+        match self.pending_buffer {
+            PendingBuffer::Unchanged => {}
+            PendingBuffer::Detached => self.current_buffer = None,
+            PendingBuffer::Attached(buffer) => self.current_buffer = buffer,
+        }
+        if let Some(geometry) = self.pending_geometry.take() {
+            self.current_geometry = geometry;
+        }
+        self.pending_buffer = PendingBuffer::Unchanged;
+    }
 }
 
 /// mpv's xdg objects, present only once mpv has created its toplevel. Holding
@@ -197,7 +453,7 @@ impl SyncSubsurface {
 }
 
 impl Shell {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             display: None,
             client: None,
@@ -212,6 +468,8 @@ impl Shell {
             mpv_client: None,
             configurator: None,
             mpv_subsurface: None,
+            buffer_sizes: HashMap::new(),
+            viewport_states: HashMap::new(),
             serial: 0,
         }
     }
@@ -224,6 +482,69 @@ impl Shell {
 
 fn with_shell<R>(f: impl FnOnce(&mut Shell) -> R) -> R {
     SHELL.with(|s| f(&mut s.borrow_mut()))
+}
+
+fn note_buffer_size(buffer: &Rc<WlBuffer>, size: BufferSize) {
+    let Some(id) = buffer.client_id() else {
+        return;
+    };
+    buffer.set_handler(TrackedBufferH);
+    with_shell(|sh| {
+        sh.buffer_sizes.insert(id, size);
+    });
+}
+
+fn forget_buffer_size(buffer: &Rc<WlBuffer>) {
+    let Some(id) = buffer.client_id() else {
+        return;
+    };
+    with_shell(|sh| {
+        sh.buffer_sizes.remove(&id);
+    });
+}
+
+fn known_buffer_size(buffer: &Rc<WlBuffer>) -> Option<BufferSize> {
+    let id = buffer.client_id()?;
+    with_shell(|sh| sh.buffer_sizes.get(&id).copied())
+}
+
+fn viewport_state_for(surface: &Rc<WlSurface>) -> Rc<RefCell<MpvSurfaceState>> {
+    with_shell(|sh| viewport_state_for_key(&mut sh.viewport_states, surface.unique_id()))
+}
+
+fn forget_viewport_state(surface: &Rc<WlSurface>) {
+    with_shell(|sh| forget_viewport_state_key(&mut sh.viewport_states, surface.unique_id()));
+}
+
+fn viewport_state_for_key(
+    states: &mut HashMap<u64, Rc<RefCell<MpvSurfaceState>>>,
+    key: u64,
+) -> Rc<RefCell<MpvSurfaceState>> {
+    states
+        .entry(key)
+        .or_insert_with(|| Rc::new(RefCell::new(MpvSurfaceState::default())))
+        .clone()
+}
+
+fn forget_viewport_state_key(states: &mut HashMap<u64, Rc<RefCell<MpvSurfaceState>>>, key: u64) {
+    states.remove(&key);
+}
+
+fn send_source(slf: &Rc<WpViewport>, source: Source) {
+    let unset = Fixed::from_i32_saturating(-1);
+    let (x, y, width, height) = match source {
+        Source::Unset => (unset, unset, unset, unset),
+        Source::Crop {
+            x,
+            y,
+            width,
+            height,
+        } => (x, y, width, height),
+    };
+    log_send(
+        "wp_viewport.set_source",
+        slf.try_send_set_source(x, y, width, height),
+    );
 }
 
 /// Forwarding sends can't unwind a handler; a failure desyncs a single message
@@ -615,6 +936,13 @@ impl WlRegistryHandler for MpvRegistryH {
             WpViewporter::INTERFACE => {
                 id.downcast::<WpViewporter>().set_handler(ClientViewporterH);
             }
+            ZwpLinuxDmabufV1::INTERFACE => {
+                id.downcast::<ZwpLinuxDmabufV1>()
+                    .set_handler(MpvLinuxDmabufH);
+            }
+            WlShm::INTERFACE => {
+                id.downcast::<WlShm>().set_handler(MpvShmH);
+            }
             _ => {}
         }
         log_send("wl_registry.bind", slf.try_send_bind(name, id));
@@ -629,7 +957,12 @@ impl WpViewporterHandler for ClientViewporterH {
         id: &Rc<WpViewport>,
         surface: &Rc<WlSurface>,
     ) {
-        id.set_handler(ClientViewportH);
+        let state = viewport_state_for(surface);
+        state.borrow_mut().viewport = Some(Rc::downgrade(id));
+        surface.set_handler(ViewportSurfaceH {
+            state: state.clone(),
+        });
+        id.set_handler(ClientViewportH { state });
         log_send(
             "wp_viewporter.get_viewport",
             slf.try_send_get_viewport(id, surface),
@@ -637,8 +970,43 @@ impl WpViewporterHandler for ClientViewporterH {
     }
 }
 
-struct ClientViewportH;
+struct ClientViewportH {
+    state: Rc<RefCell<MpvSurfaceState>>,
+}
 impl WpViewportHandler for ClientViewportH {
+    fn handle_destroy(&mut self, slf: &Rc<WpViewport>) {
+        let destroyed = Rc::downgrade(slf);
+        let mut state = self.state.borrow_mut();
+        if state
+            .viewport
+            .as_ref()
+            .is_some_and(|viewport| viewport.ptr_eq(&destroyed))
+        {
+            state.viewport = None;
+        }
+        drop(state);
+        log_send("wp_viewport.destroy", slf.try_send_destroy());
+    }
+
+    fn handle_set_source(
+        &mut self,
+        _slf: &Rc<WpViewport>,
+        x: Fixed,
+        y: Fixed,
+        width: Fixed,
+        height: Fixed,
+    ) {
+        // Source and buffer are both double-buffered state. Hold the source
+        // until the matching surface commit so a resize cannot pair it with an
+        // incompatible swapchain buffer. Valid crops are forwarded unchanged;
+        // only an out-of-bounds source is clamped or deferred.
+        if let Some(source) = Source::from_request(x, y, width, height) {
+            self.state.borrow_mut().requested_source = source;
+        } else {
+            tracing::warn!(target: "MpvProxy", "discarding malformed wp_viewport source");
+        }
+    }
+
     fn handle_set_destination(&mut self, slf: &Rc<WpViewport>, width: i32, height: i32) {
         // Virtualizing mpv's shell means it can size a viewport before it has a
         // real geometry, emitting a transient set_destination(0,0) — an instant
@@ -655,6 +1023,193 @@ impl WpViewportHandler for ClientViewportH {
         log_send(
             "wp_viewport.set_destination",
             slf.try_send_set_destination(width, height),
+        );
+    }
+}
+
+struct ViewportSurfaceH {
+    state: Rc<RefCell<MpvSurfaceState>>,
+}
+
+impl WlSurfaceHandler for ViewportSurfaceH {
+    fn handle_destroy(&mut self, slf: &Rc<WlSurface>) {
+        forget_viewport_state(slf);
+        log_send("wl_surface.destroy", slf.try_send_destroy());
+    }
+
+    fn handle_set_buffer_transform(&mut self, slf: &Rc<WlSurface>, transform: WlOutputTransform) {
+        self.state.borrow_mut().set_buffer_transform(transform);
+        log_send(
+            "wl_surface.set_buffer_transform",
+            slf.try_send_set_buffer_transform(transform),
+        );
+    }
+
+    fn handle_set_buffer_scale(&mut self, slf: &Rc<WlSurface>, scale: i32) {
+        self.state.borrow_mut().set_buffer_scale(scale);
+        log_send(
+            "wl_surface.set_buffer_scale",
+            slf.try_send_set_buffer_scale(scale),
+        );
+    }
+
+    fn handle_attach(
+        &mut self,
+        slf: &Rc<WlSurface>,
+        buffer: Option<&Rc<WlBuffer>>,
+        x: i32,
+        y: i32,
+    ) {
+        let mut state = self.state.borrow_mut();
+        match buffer {
+            None => state.attach(None),
+            Some(buffer) => match known_buffer_size(buffer) {
+                Some(size) => state.attach(Some(size)),
+                None => state.attach_unknown(),
+            },
+        }
+        drop(state);
+        log_send("wl_surface.attach", slf.try_send_attach(buffer, x, y));
+    }
+
+    fn handle_commit(&mut self, slf: &Rc<WlSurface>) {
+        let request_root_present = self.state.borrow().spliced;
+        commit_viewport_surface(slf, &self.state, request_root_present);
+    }
+}
+
+fn commit_viewport_surface(
+    surface: &Rc<WlSurface>,
+    state: &Rc<RefCell<MpvSurfaceState>>,
+    request_root_present: bool,
+) {
+    let (viewport, source) = {
+        let mut state = state.borrow_mut();
+        (
+            state.viewport.as_ref().and_then(Weak::upgrade),
+            state.source_for_commit(),
+        )
+    };
+    if let (Some(viewport), Some(source)) = (viewport, source) {
+        send_source(&viewport, source);
+    }
+    log_send("wl_surface.commit", surface.try_send_commit());
+    state.borrow_mut().committed();
+    if request_root_present {
+        crate::root_window::request_present();
+    }
+}
+
+struct TrackedBufferH;
+impl WlBufferHandler for TrackedBufferH {
+    fn handle_destroy(&mut self, slf: &Rc<WlBuffer>) {
+        forget_buffer_size(slf);
+        log_send("wl_buffer.destroy", slf.try_send_destroy());
+    }
+}
+
+struct MpvLinuxDmabufH;
+impl ZwpLinuxDmabufV1Handler for MpvLinuxDmabufH {
+    fn handle_create_params(
+        &mut self,
+        slf: &Rc<ZwpLinuxDmabufV1>,
+        params_id: &Rc<ZwpLinuxBufferParamsV1>,
+    ) {
+        params_id.set_handler(MpvLinuxBufferParamsH { pending_size: None });
+        log_send(
+            "zwp_linux_dmabuf_v1.create_params",
+            slf.try_send_create_params(params_id),
+        );
+    }
+}
+
+struct MpvLinuxBufferParamsH {
+    pending_size: Option<BufferSize>,
+}
+
+impl ZwpLinuxBufferParamsV1Handler for MpvLinuxBufferParamsH {
+    fn handle_create(
+        &mut self,
+        slf: &Rc<ZwpLinuxBufferParamsV1>,
+        width: i32,
+        height: i32,
+        format: u32,
+        flags: ZwpLinuxBufferParamsV1Flags,
+    ) {
+        self.pending_size = BufferSize::new(width, height);
+        log_send(
+            "zwp_linux_buffer_params_v1.create",
+            slf.try_send_create(width, height, format, flags),
+        );
+    }
+
+    fn handle_created(&mut self, slf: &Rc<ZwpLinuxBufferParamsV1>, buffer: &Rc<WlBuffer>) {
+        if let Some(size) = self.pending_size {
+            note_buffer_size(buffer, size);
+        }
+        log_send(
+            "zwp_linux_buffer_params_v1.created",
+            slf.try_send_created(buffer),
+        );
+    }
+
+    fn handle_create_immed(
+        &mut self,
+        slf: &Rc<ZwpLinuxBufferParamsV1>,
+        buffer: &Rc<WlBuffer>,
+        width: i32,
+        height: i32,
+        format: u32,
+        flags: ZwpLinuxBufferParamsV1Flags,
+    ) {
+        if let Some(size) = BufferSize::new(width, height) {
+            note_buffer_size(buffer, size);
+        }
+        log_send(
+            "zwp_linux_buffer_params_v1.create_immed",
+            slf.try_send_create_immed(buffer, width, height, format, flags),
+        );
+    }
+}
+
+impl BufferSize {
+    fn new(width: i32, height: i32) -> Option<Self> {
+        (width > 0 && height > 0).then_some(Self { width, height })
+    }
+}
+
+struct MpvShmH;
+impl WlShmHandler for MpvShmH {
+    fn handle_create_pool(
+        &mut self,
+        slf: &Rc<WlShm>,
+        id: &Rc<WlShmPool>,
+        fd: &Rc<OwnedFd>,
+        size: i32,
+    ) {
+        id.set_handler(MpvShmPoolH);
+        log_send("wl_shm.create_pool", slf.try_send_create_pool(id, fd, size));
+    }
+}
+
+struct MpvShmPoolH;
+impl WlShmPoolHandler for MpvShmPoolH {
+    fn handle_create_buffer(
+        &mut self,
+        slf: &Rc<WlShmPool>,
+        id: &Rc<WlBuffer>,
+        offset: i32,
+        width: i32,
+        height: i32,
+        stride: i32,
+        format: wl_proxy::protocols::wayland::wl_shm::WlShmFormat,
+    ) {
+        if let Some(size) = BufferSize::new(width, height) {
+            note_buffer_size(id, size);
+        }
+        log_send(
+            "wl_shm_pool.create_buffer",
+            slf.try_send_create_buffer(id, offset, width, height, stride, format),
         );
     }
 }
@@ -937,7 +1492,11 @@ fn splice_mpv_under_host_root(mpv_surface: Rc<WlSurface>) {
     // mpv's synchronized subsurface only displays when the root commits. Each mpv
     // commit requests a present from the single root-commit owner, so every video
     // frame applies in one transaction with the window's current geometry.
-    mpv_surface.set_handler(ChildPresentH);
+    let viewport_state = viewport_state_for(&mpv_surface);
+    viewport_state.borrow_mut().spliced = true;
+    mpv_surface.set_handler(ViewportSurfaceH {
+        state: viewport_state,
+    });
 
     let region = compositor.create_child::<WlRegion>();
     if let Err(e) = compositor.try_send_create_region(&region) {
@@ -1019,14 +1578,156 @@ impl WlCallbackHandler for RoundtripCb {
     }
 }
 
-/// Installed on mpv's video surface: mpv's commit caches its (synchronized)
-/// buffer, then a present is requested from the single root-commit owner
-/// (`root_window`), which applies it atomically with the window geometry. mpv
-/// never commits the root itself — the owner is the sole root committer.
-struct ChildPresentH;
-impl WlSurfaceHandler for ChildPresentH {
-    fn handle_commit(&mut self, slf: &Rc<WlSurface>) {
-        log_send("wl_surface.commit", slf.try_send_commit());
-        crate::root_window::request_present();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(x: i32, y: i32, width: i32, height: i32) -> Source {
+        Source::from_request(
+            Fixed::from_i32_saturating(x),
+            Fixed::from_i32_saturating(y),
+            Fixed::from_i32_saturating(width),
+            Fixed::from_i32_saturating(height),
+        )
+        .unwrap()
+    }
+
+    fn buffer(width: i32, height: i32) -> BufferSize {
+        BufferSize::new(width, height).unwrap()
+    }
+
+    #[test]
+    fn valid_source_is_forwarded_unchanged_with_its_buffer() {
+        let crop = source(10, 20, 1280, 720);
+        let mut state = MpvSurfaceState {
+            requested_source: crop,
+            ..Default::default()
+        };
+        state.attach(Some(buffer(1920, 1080)));
+
+        assert_eq!(state.source_for_commit(), Some(crop));
+    }
+
+    #[test]
+    fn oversized_source_is_clamped_only_for_the_smaller_buffer() {
+        let crop = source(100, 20, 1900, 1000);
+        let mut state = MpvSurfaceState {
+            requested_source: crop,
+            ..Default::default()
+        };
+        state.attach(Some(buffer(1920, 1080)));
+        assert_eq!(state.source_for_commit(), Some(source(100, 20, 1820, 1000)));
+        state.committed();
+
+        state.attach(Some(buffer(2560, 1440)));
+        assert_eq!(state.source_for_commit(), Some(crop));
+    }
+
+    #[test]
+    fn source_waits_for_a_buffer_we_can_validate() {
+        let crop = source(0, 0, 1280, 720);
+        let mut state = MpvSurfaceState {
+            requested_source: crop,
+            ..Default::default()
+        };
+        state.attach_unknown();
+        assert_eq!(state.source_for_commit(), None);
+        state.committed();
+
+        state.attach(Some(buffer(1280, 720)));
+        assert_eq!(state.source_for_commit(), Some(crop));
+    }
+
+    #[test]
+    fn unknown_replacement_buffer_clears_an_old_crop_before_commit() {
+        let crop = source(0, 0, 1920, 1080);
+        let mut state = MpvSurfaceState {
+            current_buffer: Some(buffer(1920, 1080)),
+            requested_source: crop,
+            forwarded_source: crop,
+            ..Default::default()
+        };
+        state.attach_unknown();
+
+        assert_eq!(state.source_for_commit(), Some(Source::Unset));
+    }
+
+    #[test]
+    fn source_outside_the_buffer_is_deferred_until_it_can_fit() {
+        let crop = source(1000, 0, 100, 100);
+        let mut state = MpvSurfaceState {
+            requested_source: crop,
+            ..Default::default()
+        };
+        state.attach(Some(buffer(800, 600)));
+        assert_eq!(state.source_for_commit(), None);
+        state.committed();
+
+        state.attach(Some(buffer(1280, 720)));
+        assert_eq!(state.source_for_commit(), Some(crop));
+    }
+
+    #[test]
+    fn unset_source_is_forwarded_after_a_previous_crop() {
+        let crop = source(0, 0, 1920, 1080);
+        let mut state = MpvSurfaceState {
+            current_buffer: Some(buffer(1920, 1080)),
+            requested_source: Source::Unset,
+            forwarded_source: crop,
+            ..Default::default()
+        };
+
+        assert_eq!(state.source_for_commit(), Some(Source::Unset));
+    }
+
+    #[test]
+    fn source_bounds_follow_pending_buffer_scale() {
+        let mut state = MpvSurfaceState {
+            requested_source: source(0, 0, 2000, 1080),
+            ..Default::default()
+        };
+        state.set_buffer_scale(2);
+        state.attach(Some(buffer(3840, 2160)));
+
+        assert_eq!(state.source_for_commit(), Some(source(0, 0, 1920, 1080)));
+    }
+
+    #[test]
+    fn rotated_buffer_swaps_source_bounds_before_validation() {
+        let mut state = MpvSurfaceState {
+            requested_source: source(0, 0, 1200, 1920),
+            ..Default::default()
+        };
+        state.set_buffer_transform(WlOutputTransform::_90);
+        state.attach(Some(buffer(1920, 1080)));
+
+        assert_eq!(state.source_for_commit(), Some(source(0, 0, 1080, 1920)));
+    }
+
+    #[test]
+    fn destroyed_surface_state_is_removed_before_a_recreated_surface_uses_its_id() {
+        let mut states = HashMap::new();
+        let first = viewport_state_for_key(&mut states, 17);
+        first.borrow_mut().spliced = true;
+        forget_viewport_state_key(&mut states, 17);
+        assert!(states.is_empty());
+
+        let replacement = viewport_state_for_key(&mut states, 17);
+        assert!(!Rc::ptr_eq(&first, &replacement));
+        assert!(!replacement.borrow().spliced);
+    }
+
+    #[test]
+    fn old_crop_is_clamped_before_a_smaller_buffer_commits() {
+        let crop = source(0, 0, 1920, 1080);
+        let mut state = MpvSurfaceState {
+            current_buffer: Some(buffer(1920, 1080)),
+            requested_source: crop,
+            forwarded_source: crop,
+            ..Default::default()
+        };
+        state.attach(Some(buffer(800, 600)));
+
+        assert_eq!(state.source_for_commit(), Some(source(0, 0, 800, 600)));
     }
 }

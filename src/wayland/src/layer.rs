@@ -69,7 +69,11 @@ impl LayerSurface {
         let Some(viewport) = self.viewport.as_ref() else {
             return;
         };
-        if src_w > 0 && src_h > 0 {
+        // A source belongs to the attached buffer. Callers that only have a
+        // destination resize pass zero and deliberately leave that source
+        // untouched; manufacturing a 1x1 source would stretch one pixel over
+        // the layer if a popup forces an intermediate commit.
+        if viewport_source(src_w, src_h).is_some() {
             viewport.set_source(0.0, 0.0, src_w as f64, src_h as f64);
         }
         if dst_w > 0 && dst_h > 0 {
@@ -91,6 +95,10 @@ impl LayerSurface {
     pub(crate) fn flush(&self) {
         let _ = self.conn.flush();
     }
+}
+
+fn viewport_source(src_w: i32, src_h: i32) -> Option<(i32, i32)> {
+    (src_w > 0 && src_h > 0).then_some((src_w, src_h))
 }
 
 pub(crate) struct FrameCommit<'a> {
@@ -146,5 +154,16 @@ impl SurfaceRef {
             viewport.destroy();
         }
         self.surface.destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destination_only_reapply_does_not_invent_a_one_pixel_source() {
+        assert_eq!(viewport_source(0, 0), None);
+        assert_eq!(viewport_source(1920, 1080), Some((1920, 1080)));
     }
 }

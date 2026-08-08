@@ -341,6 +341,12 @@ const EXTERNAL_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::ToggleFullscreen,
 ];
 #[cfg(feature = "external-frontend")]
+const EXTERNAL_SETUP_FUNCTIONS: &[NativeFunction] = &[
+    NativeFunction::SaveServerUrl,
+    NativeFunction::CheckServerConnectivity,
+    NativeFunction::CancelServerConnectivity,
+];
+#[cfg(feature = "external-frontend")]
 const EXTERNAL_SCRIPTS: &[InjectedScript] = &[InjectedScript::ExternalHost];
 
 const WINDOW_FUNCTIONS: &[NativeFunction] = &[
@@ -371,6 +377,29 @@ pub(crate) struct ExtraInfo {
     /// Decoration modes the user may choose between; empty when the setting
     /// does not apply (non-Linux).
     window_decoration_options: Vec<WindowDecorations>,
+}
+
+#[cfg(all(test, feature = "external-frontend"))]
+mod tests {
+    use super::{EXTERNAL_FUNCTIONS, EXTERNAL_SETUP_FUNCTIONS, NativeFunction};
+
+    #[test]
+    fn setup_profile_exposes_only_configuration_calls() {
+        assert_eq!(
+            EXTERNAL_SETUP_FUNCTIONS,
+            [
+                NativeFunction::SaveServerUrl,
+                NativeFunction::CheckServerConnectivity,
+                NativeFunction::CancelServerConnectivity,
+            ]
+        );
+        assert!(!EXTERNAL_SETUP_FUNCTIONS.contains(&NativeFunction::PlayJellyfinItem));
+        assert!(!EXTERNAL_SETUP_FUNCTIONS.contains(&NativeFunction::RequestAuthChallenge));
+        assert!(!EXTERNAL_SETUP_FUNCTIONS.contains(&NativeFunction::CompleteAuth));
+        assert!(!EXTERNAL_SETUP_FUNCTIONS.contains(&NativeFunction::ClearJellyfinSession));
+        assert!(!EXTERNAL_FUNCTIONS.contains(&NativeFunction::SaveServerUrl));
+        assert!(!EXTERNAL_FUNCTIONS.contains(&NativeFunction::CheckServerConnectivity));
+    }
 }
 
 impl ExtraInfo {
@@ -635,6 +664,15 @@ pub(crate) fn build_for_kind(
         #[cfg(feature = "external-frontend")]
         "external" => Some(build_extra_info(
             EXTERNAL_FUNCTIONS,
+            EXTERNAL_SCRIPTS,
+            false,
+            false,
+            shared_textures_enabled,
+            ctx_menu,
+        )),
+        #[cfg(feature = "external-frontend")]
+        "external-setup" => Some(build_extra_info(
+            EXTERNAL_SETUP_FUNCTIONS,
             EXTERNAL_SCRIPTS,
             false,
             false,

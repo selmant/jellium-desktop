@@ -87,3 +87,20 @@ pub trait HostAuthService: Send + Sync {
         callback: Box<dyn FnOnce(Result<JellyfinSessionBootstrap, HostAuthError>) + Send>,
     );
 }
+
+#[cfg(feature = "external-frontend")]
+pub trait HostConfigService: Send + Sync {
+    fn save_server_url(
+        &self,
+        request_id: &str,
+        url: &str,
+        allow_insecure: bool,
+    ) -> Result<(), String>;
+    fn check_server_connectivity(
+        &self,
+        request_id: String,
+        url: String,
+        allow_insecure: bool,
+        callback: Box<dyn FnOnce(Result<u16, String>) + Send>,
+    );
+}

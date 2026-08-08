@@ -26,6 +26,10 @@ const ENV_BACKED: &[&str] = &[ENV_LOG_LEVEL, ENV_LOG_FILE, ENV_CONFIG_DIR, ENV_C
     args_override_self = true
 )]
 pub struct Cli {
+    /// Open graphical setup page.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub setup: bool,
+
     /// Print version information and exit.
     #[arg(short = 'v', long, action = ArgAction::SetTrue)]
     pub version: bool,
