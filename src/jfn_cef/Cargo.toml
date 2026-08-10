@@ -8,6 +8,9 @@ publish.workspace = true
 name = "jfn_cef"
 crate-type = ["rlib"]
 
+[features]
+host-extension = ["dep:url"]
+
 [dependencies]
 parking_lot.workspace = true
 cef = { workspace = true }
@@ -27,6 +30,8 @@ jfn-playback = { path = "../playback" }
 serde.workspace = true
 serde_json.workspace = true
 slotmap.workspace = true
+tracing.workspace = true
+url = { workspace = true, optional = true }
 
 # Dup'ing CEF's dmabuf plane fds at the accelerated-paint boundary.
 [target.'cfg(target_os = "linux")'.dependencies]

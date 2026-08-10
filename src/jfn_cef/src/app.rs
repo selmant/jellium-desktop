@@ -606,6 +606,13 @@ fn run_user_scripts(profile: &ExtraInfo, frame: &Frame) {
         }
     }
 
+    for script in profile.host_scripts() {
+        if !code.is_empty() {
+            code.push('\n');
+        }
+        code.push_str(script);
+    }
+
     fn replace_first(code: &mut String, ph: &str, value: &str) {
         if let Some(pos) = code.find(ph) {
             code.replace_range(pos..pos + ph.len(), value);

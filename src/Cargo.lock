@@ -2346,6 +2346,8 @@ dependencies = [
  "serde",
  "serde_json",
  "slotmap",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2607,6 +2609,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

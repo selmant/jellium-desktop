@@ -62,6 +62,8 @@ pub(crate) enum NativeFunction {
     WindowStartMove,
     WindowStartResize,
     CsdReady,
+    #[cfg(feature = "host-extension")]
+    ExtensionPostMessage,
 }
 
 impl NativeFunction {
@@ -110,6 +112,8 @@ impl NativeFunction {
             "windowStartMove" => Self::WindowStartMove,
             "windowStartResize" => Self::WindowStartResize,
             "csdReady" => Self::CsdReady,
+            #[cfg(feature = "host-extension")]
+            "extensionPostMessage" => Self::ExtensionPostMessage,
             _ => return None,
         })
     }
@@ -159,6 +163,8 @@ impl NativeFunction {
             Self::WindowStartMove => "windowStartMove",
             Self::WindowStartResize => "windowStartResize",
             Self::CsdReady => "csdReady",
+            #[cfg(feature = "host-extension")]
+            Self::ExtensionPostMessage => "extensionPostMessage",
         }
     }
 }
@@ -263,6 +269,16 @@ const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
 const ABOUT_FUNCTIONS: &[NativeFunction] =
     &[NativeFunction::AboutOpenPath, NativeFunction::AboutDismiss];
 
+#[cfg(feature = "host-extension")]
+const HOST_FRONTEND_FUNCTIONS: &[NativeFunction] = &[
+    NativeFunction::ExtensionPostMessage,
+    NativeFunction::AppExit,
+    NativeFunction::ToggleFullscreen,
+];
+
+#[cfg(feature = "host-extension")]
+const HOST_FRONTEND_SETUP_FUNCTIONS: &[NativeFunction] = &[NativeFunction::ExtensionPostMessage];
+
 const WINDOW_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::WindowMinimize,
     NativeFunction::WindowToggleMaximize,
@@ -274,6 +290,7 @@ const WINDOW_FUNCTIONS: &[NativeFunction] = &[
 
 const FUNCTIONS_KEY: &str = "functions";
 const SCRIPTS_KEY: &str = "scripts";
+const HOST_SCRIPTS_KEY: &str = "host_scripts";
 const DEVICE_PROFILE_JSON_KEY: &str = "device_profile_json";
 const SHARED_TEXTURES_ENABLED_KEY: &str = "shared_textures_enabled";
 const WINDOW_DECORATIONS_KEY: &str = "window_decorations";
@@ -285,6 +302,7 @@ static DEVICE_PROFILE_JSON: OnceLock<String> = OnceLock::new();
 pub(crate) struct ExtraInfo {
     functions: Vec<NativeFunction>,
     scripts: Vec<InjectedScript>,
+    host_scripts: Vec<String>,
     device_profile_json: Option<String>,
     shared_textures_enabled: bool,
     window_decorations: Option<WindowDecorations>,
@@ -298,6 +316,7 @@ impl ExtraInfo {
         Self {
             functions: read_native_functions(&dict),
             scripts: read_injected_scripts(&dict),
+            host_scripts: read_string_list(&dict, HOST_SCRIPTS_KEY),
             device_profile_json: read_string(&dict, DEVICE_PROFILE_JSON_KEY),
             shared_textures_enabled: read_bool(&dict, SHARED_TEXTURES_ENABLED_KEY),
             window_decorations: read_string(&dict, WINDOW_DECORATIONS_KEY)
@@ -315,6 +334,7 @@ impl ExtraInfo {
         let dict = dictionary_value_create()?;
         write_native_functions(&dict, &self.functions)?;
         write_injected_scripts(&dict, &self.scripts)?;
+        write_string_list(&dict, HOST_SCRIPTS_KEY, self.host_scripts.iter().map(|s| s.as_str()))?;
         dict.set_bool(
             Some(&CefString::from(SHARED_TEXTURES_ENABLED_KEY)),
             if self.shared_textures_enabled { 1 } else { 0 },
@@ -345,6 +365,10 @@ impl ExtraInfo {
 
     pub(crate) fn scripts(&self) -> &[InjectedScript] {
         &self.scripts
+    }
+
+    pub(crate) fn host_scripts(&self) -> &[String] {
+        &self.host_scripts
     }
 
     pub(crate) fn device_profile_json(&self) -> Option<&str> {
@@ -397,6 +421,17 @@ fn read_string(dict: &DictionaryValue, key: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn read_string_list(dict: &DictionaryValue, key: &str) -> Vec<String> {
+    let Some(list) = dict.list(Some(&CefString::from(key))) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0..list.size() {
+        out.push(userfree_to_string(&list.string(i)));
+    }
+    out
 }
 
 fn read_bool(dict: &DictionaryValue, key: &str) -> bool {
@@ -461,6 +496,7 @@ fn build_extra_info(
     ExtraInfo {
         functions,
         scripts,
+        host_scripts: Vec::new(),
         device_profile_json: None,
         shared_textures_enabled,
         window_decorations: None,
@@ -491,6 +527,14 @@ pub(crate) fn build_for_kind(kind: &str, shared_textures_enabled: bool) -> Optio
                     .copied()
                     .map(InjectedScript::from_menu),
             );
+            #[cfg(feature = "host-extension")]
+            {
+                let host_scripts = crate::business_extension::host_primary_web_scripts();
+                if !host_scripts.is_empty() {
+                    extra_info.functions.push(NativeFunction::ExtensionPostMessage);
+                    extra_info.host_scripts = host_scripts;
+                }
+            }
             Some(extra_info)
         }
         "overlay" => Some(build_extra_info(
@@ -505,6 +549,28 @@ pub(crate) fn build_for_kind(kind: &str, shared_textures_enabled: bool) -> Optio
             true,
             shared_textures_enabled,
         )),
+        #[cfg(feature = "host-extension")]
+        "host-frontend" => {
+            let mut extra_info = build_extra_info(
+                HOST_FRONTEND_FUNCTIONS,
+                &[],
+                true,
+                shared_textures_enabled,
+            );
+            extra_info.host_scripts = crate::business_extension::host_frontend_scripts();
+            Some(extra_info)
+        }
+        #[cfg(feature = "host-extension")]
+        "host-frontend-setup" => {
+            let mut extra_info = build_extra_info(
+                HOST_FRONTEND_SETUP_FUNCTIONS,
+                &[],
+                false,
+                shared_textures_enabled,
+            );
+            extra_info.host_scripts = crate::business_extension::host_frontend_scripts();
+            Some(extra_info)
+        }
         _ => None,
     }
 }

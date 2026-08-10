@@ -63,6 +63,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1" }
 tracing = "0.1"
+url = "2"
 windows = "0.62"
 windows-core = "0.62"
 windows-sys = "0.61"

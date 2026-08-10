@@ -57,6 +57,14 @@ impl Inner {
             self.loaded.store(true, Ordering::Release);
             self.load_cv.notify_all();
         }
+        #[cfg(feature = "host-extension")]
+        if is_main && (200..400).contains(&code) {
+            match self.name_str().as_str() {
+                "web" => crate::business_extension::jfn_extension_on_web_load(url),
+                "host-frontend" => crate::business_extension::jfn_extension_on_frontend_load(url),
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn on_load_error(&self, code: c_int, text: &str, url: &str) {

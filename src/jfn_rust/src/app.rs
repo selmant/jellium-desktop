@@ -492,6 +492,7 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
 fn init_main_browser(
     hz: f64,
     use_shared_textures: bool,
+    host_options: &crate::host::HostOptions,
 ) -> (std::thread::JoinHandle<()>, *mut jfn_cef::JfnCefLayer) {
     // Must run before main browser create: the pre-loaded page fires its
     // initial theme-color IPC at DOMContentLoaded.
@@ -512,6 +513,21 @@ fn init_main_browser(
     let manager_thread = crate::manager::jfn_manager_start();
     jfn_playback::jfn_shutdown_set_handler(Some(h_shutdown_wake_manager));
 
+    #[cfg(feature = "host-extension")]
+    let skip_server_overlay = {
+        if let Some(extension) = host_options.extension() {
+            jfn_cef::extension::install_extension(extension);
+            !jfn_cef::business_extension::server_overlay_enabled()
+        } else {
+            false
+        }
+    };
+    #[cfg(not(feature = "host-extension"))]
+    let skip_server_overlay = {
+        let _ = host_options;
+        false
+    };
+
     let web_kind = cs("web");
     let main_layer = unsafe { jfn_cef::browsers::jfn_browsers_create(web_kind.as_ptr()) };
     jfn_cef::business_web::jfn_web_init(main_layer);
@@ -527,14 +543,28 @@ fn init_main_browser(
     }
     tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) call returned");
 
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
-    jfn_cef::business_overlay::jfn_overlay_init(main_layer);
-    tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
+    if skip_server_overlay {
+        tracing::info!(target: "Main", "[FLOW] skipping stock server overlay for host-extension");
+    } else {
+        tracing::info!(target: "Main", "[FLOW] jfn_overlay_init(main_layer)");
+        jfn_cef::business_overlay::jfn_overlay_init(main_layer);
+        tracing::info!(target: "Main", "[FLOW] jfn_overlay_init returned");
+    }
+
+    #[cfg(feature = "host-extension")]
+    {
+        jfn_cef::business_extension::jfn_extension_init(main_layer);
+    }
 
     (manager_thread, main_layer)
 }
 
 pub fn jfn_app_main() -> c_int {
+    jfn_app_main_with(crate::host::HostOptions::default())
+}
+
+/// Process entry used by embedding binaries that supply host options.
+pub fn jfn_app_main_with(host_options: crate::host::HostOptions) -> c_int {
     crate::platform_install::install_early();
 
     let rc = jfn_cef::ffi::jfn_cef_start();
@@ -590,7 +620,7 @@ pub fn jfn_app_main() -> c_int {
         &instance,
         jfn_instance_ipc::jfn::handle,
     )) {
-        Start::Started(_listener) => run_app(&instance, opts),
+        Start::Started(_listener) => run_app(&instance, opts, &host_options),
         Start::AlreadyRunning => runtime.block_on(notify_running(&instance)),
         Start::Failed(e) => {
             tracing::error!(target: "Main", "could not start instance IPC: {e}");
@@ -614,7 +644,7 @@ async fn notify_running(instance: &Instance) -> c_int {
     0
 }
 
-fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
+fn run_app(instance: &Instance, opts: StartupOptions, host_options: &crate::host::HostOptions) -> c_int {
     // Boot geometry resolves before the host prepare so its display probes
     // hit the real server, not the mpv proxy the prepare may install.
     let boot = crate::window_geometry::controller().boot();
@@ -690,7 +720,7 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
 
     log_mpv_versions();
 
-    let rc = unsafe { run_with_cef(&boot_args, instance) };
+    let rc = unsafe { run_with_cef(&boot_args, instance, host_options) };
     if rc != 0 {
         return rc;
     }
@@ -871,7 +901,7 @@ fn h_shutdown_wake_manager() {
 }
 
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
-unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
+unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance, host_options: &crate::host::HostOptions) -> c_int {
     // 2. Platform init (PlatformScope). Cleanup happens in shutdown_runtime.
     let mpv_raw = jfn_mpv::boot::jfn_mpv_handle_get();
     let platform_ok = plat().init(mpv_raw as *mut std::ffi::c_void);
@@ -899,10 +929,16 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
 
     let hz = boot_mpv_reconcile(mpv_raw);
 
-    let (manager_thread, main_layer) = init_main_browser(hz, shared_textures());
+    let (manager_thread, main_layer) = init_main_browser(hz, shared_textures(), host_options);
 
     if !start_playback_coordination(instance) {
         return 1;
+    }
+
+    #[cfg(feature = "host-extension")]
+    {
+        let _ = host_options;
+        jfn_cef::business_extension::jfn_extension_start_playback_observer();
     }
 
     // 14. Wait for the main browser to finish loading. Skipped when the

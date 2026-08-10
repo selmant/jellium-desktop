@@ -12,8 +12,13 @@ crate-type = ["rlib"]
 name = "jellium-desktop"
 path = "src/main.rs"
 
+[[example]]
+name = "host_extension"
+required-features = ["host-extension"]
+
 [features]
 default = ["kde-palette"]
+host-extension = ["dep:url", "jfn-cef/host-extension"]
 kde-palette = ["jfn-wayland/kde-palette"]
 
 [dependencies]
@@ -21,6 +26,7 @@ tracing.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+url = { workspace = true, optional = true }
 clap = { version = "4", default-features = false, features = ["std", "derive", "error-context", "help", "usage", "suggestions", "env"] }
 jfn-platform-abi = { path = "../platform_abi" }
 jfn-cef = { path = "../jfn_cef", default-features = false }

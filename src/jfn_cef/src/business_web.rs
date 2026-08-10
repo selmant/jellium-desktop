@@ -275,6 +275,11 @@ fn with_args(args: Option<&ListValue>, f: impl FnOnce(&ListValue)) -> bool {
 }
 
 fn handle_message(message: BrowserMessage) -> bool {
+    #[cfg(feature = "host-extension")]
+    if message.name() == "extensionPostMessage" {
+        return crate::business_extension::handle_primary_web_extension_message(message);
+    }
+
     let args = message.args();
 
     // mpv handle not yet initialised — return false so CEF treats the message as unhandled.
