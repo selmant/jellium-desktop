@@ -205,6 +205,8 @@ pub(super) fn run_app_state(
     client_m.display().set_handler(ForwardDisplayH);
     ctx.with_shell(|sh| sh.mpv_client = Some(client_m.clone()));
 
+    state.set_handler(AppStateH);
+
     let (mpv_worker, display_name) = match MpvWorker::spawn(rt, mpv_bridge) {
         Ok(worker) => worker,
         Err(e) => {
@@ -234,6 +236,23 @@ pub(super) fn run_app_state(
         }
         ensure_root(&ctx);
         maybe_build_root(&ctx);
+    }
+}
+
+struct AppStateH;
+impl wl_proxy::state::StateHandler for AppStateH {
+    fn display_error(
+        self: Box<Self>,
+        object: Option<&Rc<dyn Object>>,
+        server_id: u32,
+        error: u32,
+        msg: &str,
+    ) {
+        let interface = object.map_or("<deleted>", |object| object.interface().name());
+        tracing::error!(
+            target: "MpvProxy",
+            "upstream Wayland protocol error: interface={interface} id={server_id} code={error}: {msg}"
+        );
     }
 }
 
