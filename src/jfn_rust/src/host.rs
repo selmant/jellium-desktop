@@ -21,11 +21,6 @@ impl HostOptions {
     pub(crate) fn extension(&self) -> Option<Arc<dyn jfn_cef::HostExtension>> {
         self.extension.clone()
     }
-
-    #[cfg(feature = "host-extension")]
-    pub(crate) fn has_extension(&self) -> bool {
-        self.extension.is_some()
-    }
 }
 
 #[cfg(all(test, feature = "host-extension"))]
@@ -57,7 +52,6 @@ mod tests {
     #[test]
     fn default_host_options_have_no_extension() {
         let opts = HostOptions::default();
-        assert!(!opts.has_extension());
         assert!(opts.extension().is_none());
     }
 
@@ -75,6 +69,6 @@ mod tests {
             ready: Mutex::new(false),
         });
         let opts = HostOptions::with_extension(ext);
-        assert!(opts.has_extension());
+        assert!(opts.extension().is_some());
     }
 }
