@@ -504,6 +504,15 @@ fn build_extra_info(
     }
 }
 
+fn add_platform_dropdown_script(extra_info: &mut ExtraInfo) {
+    extra_info.scripts.extend(
+        jfn_platform_abi::menu_scripts(MenuKind::Dropdown)
+            .iter()
+            .copied()
+            .map(InjectedScript::from_menu),
+    );
+}
+
 pub(crate) fn build_for_kind(kind: &str, shared_textures_enabled: bool) -> Option<ExtraInfo> {
     match kind {
         "web" => {
@@ -521,12 +530,7 @@ pub(crate) fn build_for_kind(kind: &str, shared_textures_enabled: bool) -> Optio
                 extra_info.window_decoration_options =
                     p.window_decoration_options().iter().collect();
             }
-            extra_info.scripts.extend(
-                jfn_platform_abi::menu_scripts(MenuKind::Dropdown)
-                    .iter()
-                    .copied()
-                    .map(InjectedScript::from_menu),
-            );
+            add_platform_dropdown_script(&mut extra_info);
             #[cfg(feature = "host-extension")]
             {
                 let host_scripts = crate::business_extension::host_primary_web_scripts();
@@ -557,6 +561,7 @@ pub(crate) fn build_for_kind(kind: &str, shared_textures_enabled: bool) -> Optio
                 true,
                 shared_textures_enabled,
             );
+            add_platform_dropdown_script(&mut extra_info);
             extra_info.host_scripts = crate::business_extension::host_frontend_scripts();
             Some(extra_info)
         }

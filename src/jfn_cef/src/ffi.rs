@@ -64,6 +64,9 @@ pub fn jfn_cef_set_remote_debugging_port(port: c_int) {
 }
 
 pub fn jfn_cef_set_disable_gpu_compositing(disable: bool) {
+    // This is an explicit opt-out. Shared-texture availability only selects
+    // how the host presents CEF frames; Chromium can still GPU-compose the
+    // page when those frames reach the host through software paint.
     if disable {
         state::with_config(|c| {
             c.pending_switches.push(state::PendingSwitch {

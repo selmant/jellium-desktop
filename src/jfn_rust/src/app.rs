@@ -355,8 +355,17 @@ fn ensure_cef_initialized(ba: &BootArgs) -> bool {
     SHARED_TEXTURES.store(use_shared_textures, std::sync::atomic::Ordering::Release);
     jfn_cef::ffi::jfn_cef_set_log_severity(cef_severity_for_cef_filter());
     jfn_cef::ffi::jfn_cef_set_remote_debugging_port(ba.remote_debugging_port);
-    jfn_cef::ffi::jfn_cef_set_disable_gpu_compositing(!use_shared_textures);
+    // Shared textures are the zero-copy host presentation path. Chromium's
+    // compositor is independently useful when the host falls back to GPU
+    // pixel upload, especially for CSS blur and transforms. Disable it only
+    // when the user explicitly requests that behavior.
+    jfn_cef::ffi::jfn_cef_set_disable_gpu_compositing(ba.disable_gpu_compositing);
     jfn_cef::ffi::jfn_cef_set_platform_switches(plat().display());
+    tracing::info!(
+        target: "Main",
+        "CEF init: shared_textures={use_shared_textures} disable_gpu_compositing={}",
+        ba.disable_gpu_compositing
+    );
     tracing::info!(target: "Main", "[FLOW] calling CefInitialize...");
     let started = std::time::Instant::now();
     if !jfn_cef::ffi::jfn_cef_initialize() {

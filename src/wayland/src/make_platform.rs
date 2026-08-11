@@ -157,8 +157,16 @@ impl Platform for WaylandPlatform {
         wl_ops::restack(self.rt(), typed);
     }
 
-    fn menu_delivery(&self, _kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {
-        jfn_platform_abi::MenuDelivery::Host(self.rt().menu())
+    fn menu_delivery(&self, kind: jfn_platform_abi::MenuKind) -> jfn_platform_abi::MenuDelivery {
+        match kind {
+            jfn_platform_abi::MenuKind::ContextMenu => {
+                jfn_platform_abi::MenuDelivery::Host(self.rt().menu())
+            }
+            // Keep dropdown positioning in CEF view coordinates and inherit
+            // the hosted application's visual theme. A separate xdg_popup
+            // cannot reliably reproduce either invariant for arbitrary pages.
+            jfn_platform_abi::MenuKind::Dropdown => jfn_platform_abi::MenuDelivery::Page,
+        }
     }
 
     fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
