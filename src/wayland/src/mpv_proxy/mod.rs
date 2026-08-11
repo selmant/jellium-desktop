@@ -91,7 +91,7 @@ impl ProxyShared {
         (fd >= 0).then(|| unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
     }
 
-    fn window_size(&self) -> Option<WindowSize> {
+    pub(crate) fn window_size(&self) -> Option<WindowSize> {
         self.window.lock().map(|p| p.size)
     }
 

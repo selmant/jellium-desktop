@@ -81,6 +81,9 @@ pub(crate) struct Inner {
     // Opaque per-layer surface handle (PlatformSurface*); passed back to the
     // C++ platform vtable for surface_resize / present / popup.
     surface: AtomicCell<platform_ops::SurfaceHandle>,
+    // Desired layer visibility. Updated before the Wayland surface may exist
+    // so a later attach can honor a hide that raced ahead of creation.
+    visible: AtomicBool,
 
     // logical/physical dims (slice 3)
     width: AtomicI32,
@@ -180,6 +183,7 @@ impl Inner {
             pending_menu_callback: Mutex::new(None),
             injection_kind: Mutex::new(String::new()),
             surface: AtomicCell::new(platform_ops::SurfaceHandle::NONE),
+            visible: AtomicBool::new(true),
             width: AtomicI32::new(0),
             height: AtomicI32::new(0),
             physical_w: AtomicI32::new(0),

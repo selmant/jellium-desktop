@@ -52,6 +52,10 @@ pub trait MpvHost: Send + Sync {
         None
     }
 
+    /// Re-send locked host geometry to mpv after a presentation switch.
+    /// Layer show/hide can leave the VO on a stale media-sized configure.
+    fn reassert_window_size(&self) {}
+
     /// Sever host↔mpv links that could deadlock teardown. Called
     /// immediately before CEF teardown.
     fn detach(&self) {}

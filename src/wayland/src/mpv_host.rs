@@ -28,6 +28,26 @@ impl MpvHost for WaylandMpvHost {
         crate::root_window::ensure_started(self.rt);
     }
 
+    fn reassert_window_size(&self) {
+        let Some(size) = self.rt.proxy().window_size() else {
+            return;
+        };
+        tracing::debug!(
+            target: "MpvProxy",
+            w = size.w(),
+            h = size.h(),
+            "reasserting mpv window size after playback start"
+        );
+        self.rt.proxy().set_window_size(size);
+        if let Some(ext) = self.rt.window().window_extent() {
+            crate::wl_ops::on_configure(
+                self.rt,
+                ext.mode() == crate::window_state::WindowMode::Fullscreen,
+            );
+        }
+        self.rt.root().request_present();
+    }
+
     fn detach(&self) {}
 }
 

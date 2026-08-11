@@ -292,8 +292,11 @@ pub fn jfn_extension_start_playback_observer() {
     }
     jfn_playback::register_event_sink(Box::new(|event| match event.kind {
         jfn_playback::PlaybackEventKind::Started => {
-            emit_event(RuntimeEvent::PlaybackStarted);
+            // Switch surfaces on the UI thread first. Emitting PlaybackStarted
+            // can recurse into set_presentation from a playback worker; that
+            // must not flip frontend_visible before the UI task runs.
             show_primary_web_async();
+            emit_event(RuntimeEvent::PlaybackStarted);
         }
         jfn_playback::PlaybackEventKind::Finished => {
             end_playback(RuntimeEvent::PlaybackFinished);
@@ -333,9 +336,13 @@ fn apply_presentation(show_frontend: bool) {
         (frontend_ptr, web_ptr)
     };
 
-    if !server_overlay_enabled() {
-        crate::business_overlay::jfn_overlay_hide();
-    }
+    tracing::info!(
+        target: "HostExtension",
+        show_frontend,
+        "switching visible host-extension surface"
+    );
+    // Stock server-selection overlay must never cover the hosted UI or mpv.
+    crate::business_overlay::jfn_overlay_hide();
     unsafe {
         jfn_cef_layer_set_visible(frontend_ptr, show_frontend);
         jfn_cef_layer_set_visible(web_ptr, !show_frontend);
@@ -355,22 +362,37 @@ fn apply_presentation(show_frontend: bool) {
             );
         }
     }
+    // Route input to the visible surface. During playback that is Jellyfin's
+    // player OSD; otherwise the hosted frontend.
     jfn_browsers_set_active(if show_frontend { frontend_ptr } else { web_ptr });
-}
-
-wrap_task! {
-    struct ShowPrimaryWebTask {}
-    impl Task {
-        fn execute(&self) {
-            apply_presentation(false);
+    if !show_frontend {
+        // Layer show/hide can leave the Wayland VO on a stale media-sized
+        // configure; refresh locked host geometry now (same as v1).
+        if let Some(p) = jfn_platform_abi::try_get() {
+            p.mpv_host().reassert_window_size();
         }
     }
 }
 
+wrap_task! {
+    struct ApplyPresentationTask {
+        show_frontend: bool,
+    }
+    impl Task {
+        fn execute(&self) {
+            apply_presentation(self.show_frontend);
+        }
+    }
+}
+
+fn apply_presentation_async(show_frontend: bool) {
+    let mut task = ApplyPresentationTask::new(show_frontend);
+    let _ = post_task(ThreadId::UI, Some(&mut task));
+}
+
 fn show_primary_web_async() {
     jfn_extension_notify_load_starting();
-    let mut task = ShowPrimaryWebTask::new();
-    let _ = post_task(ThreadId::UI, Some(&mut task));
+    apply_presentation_async(false);
 }
 
 wrap_task! {
@@ -494,13 +516,16 @@ pub fn runtime_complete_setup_navigation(url: &str) -> bool {
 }
 
 pub fn runtime_set_presentation(presentation: Presentation) -> bool {
+    // Always hop to TID_UI. Embedders may call this from playback workers;
+    // mutating CEF visibility / frontend_visible off-thread races the
+    // playback-started UI task and can leave the hosted frontend mapped.
     match presentation {
         Presentation::Frontend => {
-            apply_presentation(true);
+            apply_presentation_async(true);
             true
         }
         Presentation::PrimaryWeb => {
-            apply_presentation(false);
+            apply_presentation_async(false);
             true
         }
     }

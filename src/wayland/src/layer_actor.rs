@@ -405,10 +405,6 @@ enum Backend {
     },
 }
 
-fn hide_detaches(backend: &Backend) -> bool {
-    matches!(backend, Backend::Shm { .. })
-}
-
 /// Only a GPU failure degrades. An `Err` from the compositor means the surface
 /// is done — anything it could absorb came back as a skip, including a failed
 /// shared import, which has no CPU fallback to degrade to.
@@ -571,23 +567,21 @@ impl Runner {
         self.current = buf;
     }
 
-    /// Returns whether the layer surface was committed. The GPU path leaves the
-    /// surface untouched — Vulkan WSI owns its buffers and an external
-    /// null-attach + commit would fight the swapchain — so it returns `false`.
+    /// Unmap the layer surface. Vulkan WSI owns the GPU surface's buffers, so
+    /// the painter (and therefore its swapchain) must be dropped before the
+    /// null attach. Keeping the painter alive merely stopped future presents
+    /// and left its last opaque frame latched above mpv.
     fn hide(&mut self, layer: &LayerSurface) -> bool {
+        tracing::info!("hiding Wayland CEF layer surface");
         if let Backend::Gpu { painter } = &mut self.backend
-            && let Some(painter) = painter.as_mut()
+            && let Some(painter) = painter.take()
         {
-            painter.set_visible(false);
+            drop(painter);
         }
-        if hide_detaches(&self.backend) {
-            layer.attach_none();
-            layer.commit();
-            self.set_current(None);
-            true
-        } else {
-            false
-        }
+        layer.attach_none();
+        layer.commit();
+        self.set_current(None);
+        true
     }
 
     fn on_present_error(&mut self, err: PresentError) {
@@ -1203,11 +1197,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_hide_performs_no_surface_op() {
-        assert!(!hide_detaches(&Backend::Gpu { painter: None }));
-        assert!(hide_detaches(&Backend::Shm {
-            shadow: ShmShadow::default(),
-        }));
+    fn hide_clears_gpu_painter_slot() {
+        let mut backend = Backend::Gpu {
+            painter: None,
+        };
+        if let Backend::Gpu { painter } = &mut backend {
+            assert!(painter.take().is_none());
+        }
+        assert!(matches!(backend, Backend::Gpu { painter: None }));
     }
 
     #[test]

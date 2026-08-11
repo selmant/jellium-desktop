@@ -83,13 +83,32 @@ impl Inner {
     }
 
     pub(crate) fn set_visible(&self, visible: bool) {
-        let surface = self.surface_handle();
-        if surface.is_none() {
+        if self.visible.swap(visible, Ordering::AcqRel) == visible {
             return;
         }
+        let surface = self.surface_handle();
+        if surface.is_none() {
+            tracing::debug!(
+                layer = %self.name_str(),
+                visible,
+                "deferred CEF layer visibility before surface creation"
+            );
+            return;
+        }
+        tracing::info!(
+            layer = %self.name_str(),
+            visible,
+            "updating CEF layer visibility"
+        );
         if let Some(p) = platform_ops::ops() {
             p.surface_set_visible(surface, visible);
         }
+        // Per-layer visibility must mirror the whole-app hidden path. In
+        // particular, WasHidden(false) tells windowless CEF to produce a fresh
+        // frame immediately; without it a remapped GPU surface can expose the
+        // layer below until the page happens to paint again. WasHidden(true)
+        // also stops the hidden host-frontend from keeping painting over mpv.
+        self.cef_was_hidden(!visible);
     }
 
     pub(crate) fn try_paste(self: &Arc<Self>) -> bool {
