@@ -2,17 +2,38 @@
 
 An unofficial [Jellyfin](https://jellyfin.org) desktop client built on [CEF](https://github.com/chromiumembedded/cef) and [mpv](https://mpv.io/).
 
+## Maintained fork and Foreseer Desktop
+
+This repository is the maintained Jellium runtime fork used by
+[Foreseer Desktop](https://github.com/selmant/foreseer-desktop). Its `main`
+branch includes a generic opt-in `host-extension` API that lets an embedding
+desktop product provide a constrained frontend, native messages, and playback
+presentation policy without exposing CEF, mpv, filesystem, or token internals.
+
+The API is deliberately product-neutral. Foreseer-specific protocol messages,
+authentication tickets, hosted origins, injected product assets, release pins,
+and user-facing setup live in Foreseer Desktop and the hosted
+[Foreseerr](https://github.com/selmant/foreseerr) application—not in Jellium.
+When no extension is configured, Jellium follows its ordinary client startup
+and playback path.
+
+For the companion product's installation, compatibility pin, and user-facing
+native-playback documentation, use:
+
+- [Foreseer Desktop](https://github.com/selmant/foreseer-desktop)
+- [Foreseerr Native Desktop guide](https://github.com/selmant/foreseerr/blob/develop/docs/using-seerr/native-desktop.md)
+
 ## Downloads
 ### Linux
 - AppImage
-  - [x86_64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-linux-appimage/main/linux-appimage-x86_64.zip)
-  - [aarch64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-linux-appimage/main/linux-appimage-aarch64.zip)
+  - [x86_64](https://nightly.link/selmant/jellium-desktop/workflows/build-linux-appimage/main/linux-appimage-x86_64.zip)
+  - [aarch64](https://nightly.link/selmant/jellium-desktop/workflows/build-linux-appimage/main/linux-appimage-aarch64.zip)
 - Arch Linux (AUR): [jellium-desktop-git](https://aur.archlinux.org/packages/jellium-desktop-git)
-- [Flatpak (non-Flathub bundle)](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-linux-flatpak/main/linux-flatpak-x86_64.zip)
+- [Flatpak (non-Flathub bundle)](https://nightly.link/selmant/jellium-desktop/workflows/build-linux-flatpak/main/linux-flatpak-x86_64.zip)
 
 ### macOS
-- [Apple Silicon](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-macos/main/macos-arm64.zip)
-- [Intel](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-macos/main/macos-x86_64.zip)
+- [Apple Silicon](https://nightly.link/selmant/jellium-desktop/workflows/build-macos/main/macos-arm64.zip)
+- [Intel](https://nightly.link/selmant/jellium-desktop/workflows/build-macos/main/macos-x86_64.zip)
 
 After installing, remove quarantine: 
 ```
@@ -20,8 +41,8 @@ sudo xattr -cr /Applications/Jellium\ Desktop.app
 ```
 
 ### Windows
-- [x64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-x64.zip)
-- [arm64](https://nightly.link/andrewrabert/jellium-desktop/workflows/build-windows/main/windows-arm64.zip)
+- [x64](https://nightly.link/selmant/jellium-desktop/workflows/build-windows/main/windows-x64.zip)
+- [arm64](https://nightly.link/selmant/jellium-desktop/workflows/build-windows/main/windows-arm64.zip)
 
 
 ## Development
