@@ -57,17 +57,18 @@
                     this._started = true;
                     this.loading.hide();
                     const dlg = this._videoDialog;
-                    // Remove poster so video shows through from subsurface
-                    if (dlg) {
-                        const poster = dlg.querySelector('.mpvPoster');
-                        if (poster) poster.remove();
-                    }
                     // "fullscreen" = fills entire web content area, not the actual screen
                     if (this._currentPlayOptions?.fullscreen) {
                         this.appRouter.showVideoOsd();
                         if (dlg) dlg.style.zIndex = 'unset';
                     }
                     window.api.player.setVideoRectangle(0, 0, 0, 0);
+                    // Drop the poster only after OSD route + veil are in place so
+                    // transparent CEF never composites Jellyfin login/library.
+                    if (dlg) {
+                        const poster = dlg.querySelector('.mpvPoster');
+                        if (poster) poster.remove();
+                    }
                 }
                 this._emitPlaying();
             };
@@ -243,6 +244,10 @@
         }
 
         removeMediaDialog() {
+            // Veil before tearing down the poster so transparent CEF cannot
+            // flash Jellyfin chrome on stop/back.
+            document.body && document.body.classList.add('jmp-play-preparing');
+            document.documentElement.style.setProperty('opacity', '0', 'important');
             window.api.player.stop();
             if (window.jmpNative) window.jmpNative.playerOsdActive(false);
             window.api.player.setVideoRectangle(-1, 0, 0, 0);
@@ -302,6 +307,10 @@
             });
             if (isNewDlg) ready.then(() => this.setTransparency(2));
             dlg.appendChild(poster);
+
+            // Host-extension PrimaryWebPreparing keeps document opacity at 0 so
+            // Jellyfin chrome stays veiled; lift it only after the poster exists.
+            document.documentElement.style.removeProperty('opacity');
 
             if (options.fullscreen) document.body.classList.add('hide-scroll');  // fills entire web content area, not the actual screen
             return ready;

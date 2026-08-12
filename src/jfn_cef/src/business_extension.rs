@@ -32,7 +32,7 @@ struct ExtensionState {
     primary_web_allowed_origin: Option<String>,
     setup_document_url: Option<String>,
     setup_generation: u64,
-    frontend_visible: bool,
+    presentation: Presentation,
     playback_epoch: u64,
 }
 
@@ -131,7 +131,7 @@ pub fn jfn_extension_init(web_layer: *mut JfnCefLayer) {
         primary_web_allowed_origin: None,
         setup_document_url: setup_document.then_some(start_url.clone()),
         setup_generation: 0,
-        frontend_visible: true,
+        presentation: Presentation::Frontend,
         playback_epoch: 0,
     });
 
@@ -298,7 +298,7 @@ pub fn jfn_extension_start_playback_observer() {
         jfn_playback::PlaybackEventKind::Started => {
             // Switch surfaces on the UI thread first. Emitting PlaybackStarted
             // can recurse into set_presentation from a playback worker; that
-            // must not flip frontend_visible before the UI task runs.
+            // must not flip presentation before the UI task runs.
             show_primary_web_async();
             emit_event(RuntimeEvent::PlaybackStarted);
         }
@@ -321,13 +321,70 @@ fn end_playback(event: RuntimeEvent) {
     emit_event(event);
 }
 
-fn apply_presentation(show_frontend: bool) {
+const PRIMARY_WEB_VEIL_JS: &str = concat!(
+    "(function(){",
+    "var s=document.getElementById('jmp-play-preparing-style');",
+    "if(!s){",
+    "s=document.createElement('style');",
+    "s.id='jmp-play-preparing-style';",
+    "document.documentElement.appendChild(s);",
+    "}",
+    // Hide all page chrome; re-show only the player shell + OSD chrome so
+    // mpv can show through without flashing Jellyfin login/library.
+    "s.textContent=",
+    "'body.jmp-play-preparing{background:transparent!important;}",
+    "body.jmp-play-preparing *{visibility:hidden!important;}",
+    "body.jmp-play-preparing .videoPlayerContainer,",
+    "body.jmp-play-preparing .videoPlayerContainer *,",
+    "body.jmp-play-preparing .videoOsdBottom,",
+    "body.jmp-play-preparing .videoOsdBottom *,",
+    "body.jmp-play-preparing .osdHeader,",
+    "body.jmp-play-preparing .osdHeader *,",
+    "body.jmp-play-preparing .skinHeader.osdHeader,",
+    "body.jmp-play-preparing .skinHeader.osdHeader *,",
+    "body.jmp-play-preparing .chapterThumbContainer,",
+    "body.jmp-play-preparing .chapterThumbContainer *,",
+    "body.jmp-play-preparing .dialogContainer,",
+    "body.jmp-play-preparing .dialogContainer *,",
+    "body.jmp-play-preparing .toastContainer,",
+    "body.jmp-play-preparing .toastContainer *{",
+    "visibility:visible!important;}'",
+    ";",
+    "document.body&&document.body.classList.add('jmp-play-preparing');",
+    // Keep the page veiled until mpv-video-player mounts the poster and
+    // clears opacity; WasHidden is already false so CSS anims can run.
+    "document.documentElement.style.setProperty('opacity','0','important');",
+    "document.documentElement.style.setProperty('background','#000','important');",
+    "document.body&&document.body.style.setProperty('background','#000','important');",
+    "})();",
+);
+
+const PRIMARY_WEB_REVEAL_JS: &str = concat!(
+    "(function(){",
+    // Keep jmp-play-preparing for the whole playback session so removing the
+    // poster does not expose Jellyfin login/library through transparent CEF.
+    "document.documentElement.style.removeProperty('opacity');",
+    "document.documentElement.style.setProperty('background','transparent','important');",
+    "document.body&&document.body.style.setProperty('background','transparent','important');",
+    "})();",
+);
+
+const PRIMARY_WEB_HIDE_JS: &str = concat!(
+    "(function(){",
+    "document.body&&document.body.classList.add('jmp-play-preparing');",
+    "document.documentElement.style.setProperty('opacity','0','important');",
+    "document.documentElement.style.setProperty('background','transparent','important');",
+    "document.body&&document.body.style.setProperty('background','transparent','important');",
+    "})();",
+);
+
+fn apply_presentation(presentation: Presentation) {
     let (frontend_ptr, web_ptr) = {
         let mut instance = INSTANCE.lock();
         let Some(state) = instance.as_mut() else {
             return;
         };
-        if state.frontend_visible == show_frontend {
+        if state.presentation == presentation {
             return;
         }
         let frontend_ptr = state.frontend.layer_ptr();
@@ -336,67 +393,81 @@ fn apply_presentation(show_frontend: bool) {
             tracing::warn!(target: "HostExtension", "presentation switch ignored: layer not ready");
             return;
         }
-        state.frontend_visible = show_frontend;
+        state.presentation = presentation;
         (frontend_ptr, web_ptr)
     };
 
+    let show_frontend = matches!(presentation, Presentation::Frontend);
     tracing::info!(
         target: "HostExtension",
-        show_frontend,
+        ?presentation,
         "switching visible host-extension surface"
     );
     // Stock server-selection overlay must never cover the hosted UI or mpv.
     crate::business_overlay::jfn_overlay_hide();
-    unsafe {
-        jfn_cef_layer_set_visible(frontend_ptr, show_frontend);
-        jfn_cef_layer_set_visible(web_ptr, !show_frontend);
-    }
+
     let web_layer = INSTANCE
         .lock()
         .as_ref()
         .map(|state| Arc::clone(&state.primary_web));
-    if let Some(web_layer) = web_layer {
-        if show_frontend {
-            web_layer.exec_js(
-                "document.documentElement.style.setProperty('opacity','0','important');document.documentElement.style.setProperty('background','transparent','important');document.body?.style.setProperty('background','transparent','important');",
-            );
-        } else {
-            web_layer.exec_js(
-                "document.documentElement.style.removeProperty('opacity');document.documentElement.style.setProperty('background','transparent','important');document.body?.style.setProperty('background','transparent','important');",
-            );
+
+    if show_frontend {
+        // Hide Jellyfin before mapping Foreseer so the last PrimaryWeb frame
+        // (login/library) cannot flash during back/restore.
+        unsafe {
+            jfn_cef_layer_set_visible(web_ptr, false);
+        }
+        if let Some(web_layer) = web_layer.as_ref() {
+            web_layer.exec_js(PRIMARY_WEB_HIDE_JS);
+        }
+        unsafe {
+            jfn_cef_layer_set_visible(frontend_ptr, true);
+        }
+        jfn_browsers_set_active(frontend_ptr);
+        return;
+    }
+
+    // Veil JS before mapping so the first composited frame is not Jellyfin chrome.
+    if let Some(web_layer) = web_layer.as_ref() {
+        match presentation {
+            Presentation::Frontend => unreachable!(),
+            Presentation::PrimaryWebPreparing => web_layer.exec_js(PRIMARY_WEB_VEIL_JS),
+            Presentation::PrimaryWeb => web_layer.exec_js(PRIMARY_WEB_REVEAL_JS),
         }
     }
-    // Route input to the visible surface. During playback that is Jellyfin's
-    // player OSD; otherwise the hosted frontend.
-    jfn_browsers_set_active(if show_frontend { frontend_ptr } else { web_ptr });
-    if !show_frontend {
-        // Layer show/hide can leave the Wayland VO on a stale media-sized
-        // configure; refresh locked host geometry now (same as v1).
-        if let Some(p) = jfn_platform_abi::try_get() {
-            p.mpv_host().reassert_window_size();
-        }
+
+    unsafe {
+        jfn_cef_layer_set_visible(frontend_ptr, false);
+        jfn_cef_layer_set_visible(web_ptr, true);
+    }
+    // Route input to Jellyfin's player OSD while PrimaryWeb is up.
+    jfn_browsers_set_active(web_ptr);
+    // Layer show/hide can leave the Wayland VO on a stale media-sized
+    // configure; refresh locked host geometry now (same as v1).
+    if let Some(p) = jfn_platform_abi::try_get() {
+        p.mpv_host().reassert_window_size();
     }
 }
 
 wrap_task! {
     struct ApplyPresentationTask {
-        show_frontend: bool,
+        presentation: Presentation,
     }
     impl Task {
         fn execute(&self) {
-            apply_presentation(self.show_frontend);
+            apply_presentation(self.presentation);
         }
     }
 }
 
-fn apply_presentation_async(show_frontend: bool) {
-    let mut task = ApplyPresentationTask::new(show_frontend);
+fn apply_presentation_async(presentation: Presentation) {
+    let mut task = ApplyPresentationTask::new(presentation);
     let _ = post_task(ThreadId::UI, Some(&mut task));
 }
 
 fn show_primary_web_async() {
     jfn_extension_notify_load_starting();
-    apply_presentation_async(false);
+    apply_presentation_async(Presentation::PrimaryWeb);
 }
 
 wrap_task! {
@@ -407,7 +478,7 @@ wrap_task! {
         fn execute(&self) {
             let current = INSTANCE.lock().as_ref().map(|s| s.playback_epoch).unwrap_or(0);
             if self.epoch == current {
-                apply_presentation(true);
+                apply_presentation(Presentation::Frontend);
             }
         }
     }
@@ -521,18 +592,10 @@ pub fn runtime_complete_setup_navigation(url: &str) -> bool {
 
 pub fn runtime_set_presentation(presentation: Presentation) -> bool {
     // Always hop to TID_UI. Embedders may call this from playback workers;
-    // mutating CEF visibility / frontend_visible off-thread races the
+    // mutating CEF visibility / presentation off-thread races the
     // playback-started UI task and can leave the hosted frontend mapped.
-    match presentation {
-        Presentation::Frontend => {
-            apply_presentation_async(true);
-            true
-        }
-        Presentation::PrimaryWeb => {
-            apply_presentation_async(false);
-            true
-        }
-    }
+    apply_presentation_async(presentation);
+    true
 }
 
 pub fn runtime_minimize() {

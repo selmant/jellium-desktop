@@ -133,6 +133,9 @@ pub enum ExtensionSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Presentation {
     Frontend,
+    /// Primary CEF mapped and not WasHidden (CSS/timers run) but page chrome
+    /// stays veiled until the player shell mounts or [`PrimaryWeb`] is set.
+    PrimaryWebPreparing,
     PrimaryWeb,
 }
 
@@ -287,13 +290,9 @@ mod tests {
 
     #[test]
     fn rejects_evil_subdomain_as_different_origin() {
-        let desc = HostExtensionDescriptor::from_url(
-            "https://media.example.com/",
-            vec![],
-            vec![],
-            false,
-        )
-        .unwrap();
+        let desc =
+            HostExtensionDescriptor::from_url("https://media.example.com/", vec![], vec![], false)
+                .unwrap();
         assert_ne!(desc.allowed_origin, "https://evil.media.example.com");
         assert_ne!(desc.allowed_origin, "https://media.example.com.evil.com");
     }
