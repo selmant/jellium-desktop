@@ -1,5 +1,6 @@
 //! Narrow configuration API for binaries embedding the Jellium runtime.
 
+#[cfg(feature = "host-extension")]
 use std::sync::Arc;
 
 /// Options supplied by a desktop binary hosting the Jellium runtime.
