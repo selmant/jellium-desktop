@@ -188,6 +188,12 @@ fn transition(state: LifecycleState, msg: ManagerMsg) -> LifecycleState {
 /// releases the process main thread to run the teardown tail. One
 /// snapshot, no race between close set and wait set.
 fn run_shutdown() {
+    // Notify host extensions from the central shutdown path, not inline from
+    // RuntimeHandle::request_shutdown. Besides covering native window and
+    // signal-driven exits, this avoids re-entering an embedder while it is
+    // handling the command that requested shutdown.
+    #[cfg(feature = "host-extension")]
+    jfn_cef::business_extension::jfn_extension_begin_shutdown();
     jfn_playback::shutdown::jfn_shutdown_fanout();
     jfn_cef::browsers::jfn_browsers_close_all_blocking();
     jfn_platform_abi::get().wake_main_loop();

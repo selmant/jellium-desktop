@@ -150,7 +150,11 @@ pub fn jfn_extension_init(web_layer: *mut JfnCefLayer) {
     emit_event(RuntimeEvent::FrontendCreated);
 }
 
-fn install_handlers(layer: *mut JfnCefLayer, source: ExtensionSource, inner_for_created: Arc<Inner>) {
+fn install_handlers(
+    layer: *mut JfnCefLayer,
+    source: ExtensionSource,
+    inner_for_created: Arc<Inner>,
+) {
     let layer_ref = unsafe { &*layer };
     layer_ref.set_created_callback_rust(Some(Box::new(move |_browser: *mut c_void| {
         let ptr = inner_for_created.layer_ptr();
@@ -550,7 +554,11 @@ pub fn runtime_toggle_fullscreen() {
 }
 
 pub fn runtime_request_shutdown() {
-    emit_event(RuntimeEvent::ShutdownBeginning);
+    // Do not notify the embedder inline here. RuntimeHandle methods may be
+    // called from inside HostExtension::admit_message while the embedder holds
+    // its own state lock; synchronously re-entering on_runtime_event would
+    // deadlock that thread. The runtime manager emits ShutdownBeginning once
+    // it observes the process-wide shutdown flag.
     jfn_playback::jfn_shutdown_initiate();
 }
 
