@@ -412,7 +412,7 @@ fn apply_presentation(presentation: Presentation) {
         .map(|state| Arc::clone(&state.primary_web));
 
     if show_frontend {
-        // Hide Jellyfin before mapping Foreseer so the last PrimaryWeb frame
+        // Hide Jellyfin before mapping the hosted frontend so the last PrimaryWeb frame
         // (login/library) cannot flash during back/restore.
         unsafe {
             jfn_cef_layer_set_visible(web_ptr, false);
