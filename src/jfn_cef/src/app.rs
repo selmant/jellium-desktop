@@ -588,7 +588,7 @@ fn inject_jmp_native(browser: &mut Browser, profile: &ExtraInfo, context: &mut V
 
 fn run_user_scripts(profile: &ExtraInfo, frame: &Frame) {
     let scripts = profile.scripts();
-    if scripts.is_empty() {
+    if scripts.is_empty() && profile.host_scripts().is_empty() {
         return;
     }
 
