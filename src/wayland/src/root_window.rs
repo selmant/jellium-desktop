@@ -1209,7 +1209,8 @@ fn root_loop(
     let fd = conn.as_fd().as_raw_fd();
     let wake_fd = wake.fd();
     loop {
-        if queue.dispatch_pending(&mut state).is_err() {
+        if let Err(e) = queue.dispatch_pending(&mut state) {
+            tracing::error!(target: "Main", "root window: dispatch failed: {e}");
             break;
         }
         // The batch is drained: a preferred_scale queued behind the configure
@@ -1259,15 +1260,17 @@ fn root_loop(
                 drop(guard);
                 continue;
             }
-            Err(_) => {
+            Err(e) => {
                 drop(guard);
+                tracing::error!(target: "Main", "root window: display poll failed: {e}");
                 break;
             }
             Ok(_) => {}
         }
         let revents = |i: usize| pfds[i].revents().unwrap_or(PollFlags::empty());
         if revents(0).contains(PollFlags::POLLIN) {
-            if guard.read().is_err() {
+            if let Err(e) = guard.read() {
+                tracing::error!(target: "Main", "root window: display read failed: {e}");
                 break;
             }
             // This thread is the sole reader of the shared display; the read
@@ -1279,6 +1282,7 @@ fn root_loop(
             drop(guard);
         }
         if revents(0).intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+            tracing::error!(target: "Main", events = ?revents(0), "root window: display fd failed");
             break;
         }
         if revents(1).contains(PollFlags::POLLIN) {

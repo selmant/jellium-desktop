@@ -820,13 +820,12 @@ impl Runner {
             bgra: &p.pixels,
             dirty: &p.dirty,
         };
-        // Set the viewport source inside the present closure, not here: a
-        // dropped frame must not leave a source pending ahead of the next
-        // buffer. Clamped to min(buffer, physical) to stay within bounds.
-        let src_w = (p.width as i32).min(vps.pw);
-        let src_h = (p.height as i32).min(vps.ph);
+        // WSI owns the attached wl_buffer and can present one buffer from the
+        // retired swapchain during resize. Use the protocol's implicit full-
+        // buffer source so this transaction is valid for whichever buffer WSI
+        // actually attaches; only the logical destination is ours to specify.
         painter.push_pixels(pixel_frame, || {
-            layer.set_viewport(src_w, src_h, vps.lw, vps.lh)
+            layer.set_full_buffer_viewport(vps.lw, vps.lh)
         })?;
         Ok(Present::Committed)
     }

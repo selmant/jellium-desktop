@@ -11,6 +11,7 @@
             this.artworkAbortController = null;
             this.pendingArtworkUrl = null;
             this.attachedPlayer = null;
+            this.externalPlayGeneration = 0;
 
             console.debug('[Media] inputPlugin constructed with playbackManager:', !!playbackManager);
 
@@ -20,14 +21,46 @@
 
             this.externalPlayItem = (itemId) => {
                 if (typeof itemId !== 'string' || !itemId || !this.playbackManager) return;
-                const serverId = window.ApiClient?.serverId?.();
-                if (!serverId) {
+                const apiClient = window.ApiClient;
+                const serverId = apiClient?.serverId?.();
+                const userId = apiClient?.getCurrentUserId?.();
+                if (!serverId || !userId) {
                     console.error('[Media] external play request failed: Jellyfin server unavailable');
                     if (window.jmpNative) window.jmpNative.notifyPlaybackState('Stopped');
                     return;
                 }
-                Promise.resolve(this.playbackManager.play({ ids: [itemId], serverId }))
+                // Resolve the saved position inside the authenticated Jellyfin
+                // Web layer, then retain its normal ID-based playback path.
+                // This keeps native resume separate from Wayland/mpv lifecycle.
+                const generation = ++this.externalPlayGeneration;
+                const play = (options) => Promise.resolve(this.playbackManager.play(options));
+                const playWithoutResume = () => play({ ids: [itemId], serverId });
+                const itemRequest = typeof apiClient.getItem === 'function'
+                    ? apiClient.getItem(userId, itemId)
+                    : null;
+                if (!itemRequest) {
+                    playWithoutResume().catch((error) => {
+                        console.error('[Media] external play request failed:', error);
+                        if (window.jmpNative) window.jmpNative.notifyPlaybackState('Stopped');
+                    });
+                    return;
+                }
+                Promise.resolve(itemRequest)
+                    .then((item) => {
+                        if (generation !== this.externalPlayGeneration) return;
+                        if (!item?.Id) return playWithoutResume();
+                        return play({
+                            ids: [itemId],
+                            serverId,
+                            startPositionTicks: item.UserData?.PlaybackPositionTicks || 0,
+                        });
+                    }, (error) => {
+                        if (generation !== this.externalPlayGeneration) return;
+                        console.warn('[Media] unable to load resume data; starting normally:', error);
+                        return playWithoutResume();
+                    })
                     .catch((error) => {
+                        if (generation !== this.externalPlayGeneration) return;
                         console.error('[Media] external play request failed:', error);
                         if (window.jmpNative) window.jmpNative.notifyPlaybackState('Stopped');
                     });

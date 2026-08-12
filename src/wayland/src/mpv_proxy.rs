@@ -700,6 +700,7 @@ fn run_app_state(
     client_m.set_handler(NoopClient);
     client_m.display().set_handler(ForwardDisplayH);
     with_shell(|sh| sh.mpv_client = Some(client_m.clone()));
+    state.set_handler(AppStateH);
 
     while state.is_not_destroyed() {
         match state.dispatch(None) {
@@ -711,6 +712,23 @@ fn run_app_state(
         }
         ensure_root();
         maybe_build_root();
+    }
+}
+
+struct AppStateH;
+impl wl_proxy::state::StateHandler for AppStateH {
+    fn display_error(
+        self: Box<Self>,
+        object: Option<&Rc<dyn Object>>,
+        server_id: u32,
+        error: u32,
+        msg: &str,
+    ) {
+        let interface = object.map_or("<deleted>", |object| object.interface().name());
+        tracing::error!(
+            target: "MpvProxy",
+            "upstream Wayland protocol error: interface={interface} id={server_id} code={error}: {msg}"
+        );
     }
 }
 
