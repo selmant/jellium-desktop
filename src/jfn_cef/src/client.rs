@@ -105,9 +105,9 @@ pub(crate) struct Inner {
     last_was_resized_ns: AtomicI64,
 
     // popup state (slice 4). Owned 1:1 with the platform surface; each
-    // CefLayer owns its popup on the platform side. Two-phase reveal: rect
-    // arrives via OnPopupSize, options via the "popupOptions" renderer IPC;
-    // try_show_popup fires when popup_visible + size_received + options_received.
+    // CefLayer owns its popup on the platform side. Host menus wait for
+    // OnPopupSize plus "popupOptions" IPC; the composited OSR visual maps as
+    // soon as the rect arrives so the first popup paint is not dropped.
     popup: Mutex<PopupState>,
     dropdown: jfn_platform_abi::MenuDelivery,
 

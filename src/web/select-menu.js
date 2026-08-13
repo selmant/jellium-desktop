@@ -9,6 +9,16 @@
         return el && el.tagName === 'SELECT' && !el.multiple && el.size <= 1 && !el.disabled;
     }
 
+    function isTransparent(color) {
+        if (!color || color === 'transparent') return true;
+        var m = color.match(/rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)(?:\s*,\s*([\d.]+))?\s*\)/i);
+        return !!(m && m[4] !== undefined && parseFloat(m[4]) === 0);
+    }
+
+    function opaqueColor(color, fallback) {
+        return isTransparent(color) ? fallback : color;
+    }
+
     function closeOpen() {
         if (open) open();
     }
@@ -17,9 +27,13 @@
         closeOpen();
 
         var computed = getComputedStyle(select);
-        var background = computed.backgroundColor;
-        var foreground = computed.color;
-        var border = computed.borderTopColor;
+        var page = getComputedStyle(document.documentElement);
+        var background = opaqueColor(
+            computed.backgroundColor,
+            opaqueColor(page.backgroundColor, 'rgb(32, 32, 36)')
+        );
+        var foreground = opaqueColor(computed.color, opaqueColor(page.color, 'rgb(235, 235, 235)'));
+        var border = opaqueColor(computed.borderTopColor, 'rgba(255, 255, 255, 0.18)');
         var radius = computed.borderRadius;
         var accent = computed.accentColor;
         if (!accent || accent === 'auto') accent = 'rgb(79, 70, 229)';
@@ -179,15 +193,19 @@
     }
 
     // Capture phase so we intercept before the engine opens the native popup.
-    document.addEventListener('mousedown', function (e) {
+    // pointerdown fires first on Windows CEF; handling both would open then
+    // immediately dismiss on the following mousedown.
+    function onActivate(e) {
         if (e.button !== 0) return;
         var select = e.target.closest && e.target.closest('select');
         if (!isDropdown(select)) return;
         e.preventDefault();
+        e.stopImmediatePropagation();
         if (open) { closeOpen(); return; }
         select.focus();
         openMenu(select);
-    }, true);
+    }
+    document.addEventListener(window.PointerEvent ? 'pointerdown' : 'mousedown', onActivate, true);
 
     document.addEventListener('keydown', function (e) {
         // While open, the menu's own capture-phase handler owns the keyboard.
@@ -197,6 +215,7 @@
             (e.altKey && (e.key === 'ArrowDown' || e.key === 'ArrowUp'));
         if (!opens) return;
         e.preventDefault();
+        e.stopImmediatePropagation();
         openMenu(document.activeElement);
     }, true);
 })();

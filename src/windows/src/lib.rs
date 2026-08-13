@@ -193,7 +193,11 @@ impl Platform for WindowsPlatform {
     fn menu_delivery(&self, kind: MenuKind) -> MenuDelivery {
         match kind {
             MenuKind::ContextMenu => MenuDelivery::Host(&menu::WinMenuHost),
-            MenuKind::Dropdown => MenuDelivery::Composited,
+            // In-page menu, same as Wayland/X11: CEF view coordinates and the
+            // hosted theme. The DComp OSR popup is placed from a second scale,
+            // and showing it used to drop an unused MenuSelection which
+            // replayed Escape into CEF and closed the dropdown immediately.
+            MenuKind::Dropdown => MenuDelivery::Page,
         }
     }
 
