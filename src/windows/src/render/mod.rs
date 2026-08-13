@@ -54,9 +54,9 @@ pub(crate) enum Part {
 pub(crate) struct SurfaceId(u64);
 
 /// One CEF surface. The only constructor builds both visuals, nests the popup
-/// under the content visual, and parents the content visual to the root, so
-/// an `Entry` that exists is a surface that is in the tree with its popup
-/// nested — neither is a rule the rest of the module has to keep.
+/// under the content visual, and parents the content visual to the root.
+/// A later hide unparents the content visual (popup goes with it) so it
+/// cannot cover the window below; show reparents it with its last frame.
 struct Entry {
     id: SurfaceId,
     content: Layer,
@@ -93,12 +93,19 @@ impl Entry {
             let _ = root.RemoveVisual(self.content.visual());
         }
     }
+
+    /// Reinsert on top of the root's current children.
+    fn parent_on_top(&mut self, root: &IDCompositionVisual) {
+        unsafe {
+            let _ = root.AddVisual(self.content.visual(), true, None::<&IDCompositionVisual>);
+        }
+    }
 }
 
 struct Registry {
     devices: Option<Devices>,
-    /// Live surfaces, bottom-to-top: exactly the root visual's children, in
-    /// the root's child order.
+    /// Live surfaces, bottom-to-top. Visible ones are the root visual's
+    /// children, in the root's child order; hidden ones are unparented.
     surfaces: Vec<Entry>,
     next_id: u64,
 }
@@ -211,9 +218,9 @@ pub(crate) fn free(h: SurfaceHandle) {
     }
 }
 
-/// Reorder the root's children bottom-to-top. Live surfaces `ordered` does
-/// not name keep their relative order above those it does, so every live
-/// surface stays parented.
+/// Reorder the root's children bottom-to-top. Hidden surfaces stay
+/// unparented. Live surfaces `ordered` does not name keep their relative
+/// order above those it does.
 pub(crate) fn restack(ordered: &[SurfaceHandle]) {
     let mut st = STATE.lock();
     let Registry {
@@ -236,6 +243,9 @@ pub(crate) fn restack(ordered: &[SurfaceHandle]) {
         }
         let mut prev: Option<&IDCompositionVisual> = None;
         for entry in &named {
+            if !entry.content.is_visible() {
+                continue;
+            }
             let visual = entry.content.visual();
             let placed = match prev {
                 Some(prev) => root.AddVisual(visual, true, prev),
@@ -252,16 +262,35 @@ pub(crate) fn restack(ordered: &[SurfaceHandle]) {
     st.commit();
 }
 
-/// Show or hide a surface's content visual. Hiding detaches its content, so
-/// showing it again cannot flash the frame it was hidden with.
+/// Show or hide a surface's content visual.
+///
+/// Hide unparents the visual from the root (Wayland/X11 unmap, macOS
+/// `setHidden`) and keeps the swapchain bound, so a later show remaps the
+/// last frame immediately. Detaching instead left an empty DComp visual over
+/// mpv's idle window until CEF happened to paint — a black screen after
+/// host-extension playback restore.
 pub(crate) fn set_visible(h: SurfaceHandle, visible: bool) {
     let mut st = STATE.lock();
-    let changed = st
-        .find_mut(h)
-        .is_some_and(|entry| entry.content.set_visible(visible));
-    if changed {
-        st.commit();
+    {
+        let Registry {
+            devices, surfaces, ..
+        } = &mut *st;
+        let Some(root) = devices.as_ref().map(Devices::root) else {
+            return;
+        };
+        let Some(entry) = surfaces.iter_mut().find(|e| e.id.0 == h.id()) else {
+            return;
+        };
+        if !entry.content.set_mapped(visible) {
+            return;
+        }
+        if visible {
+            entry.parent_on_top(root);
+        } else {
+            entry.unparent(root);
+        }
     }
+    st.commit();
 }
 
 /// Present one frame to `part`. False when the surface is gone, the part is

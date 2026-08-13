@@ -49,12 +49,27 @@ impl Layer {
         &self.visual
     }
 
-    /// Returns whether visibility changed; a hide detaches the content.
-    pub(crate) fn set_visible(&mut self, visible: bool) -> bool {
+    pub(crate) fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Flip the present gate without touching the visual tree or swapchain.
+    /// Content hide/show unparents the visual instead, so the last frame is
+    /// still bound when it is remapped.
+    pub(crate) fn set_mapped(&mut self, visible: bool) -> bool {
         if self.visible == visible {
             return false;
         }
         self.visible = visible;
+        true
+    }
+
+    /// Returns whether visibility changed. A hide detaches the content so a
+    /// nested popup cannot flash its last frame when shown again.
+    pub(crate) fn set_visible(&mut self, visible: bool) -> bool {
+        if !self.set_mapped(visible) {
+            return false;
+        }
         if !visible {
             self.detach();
         }

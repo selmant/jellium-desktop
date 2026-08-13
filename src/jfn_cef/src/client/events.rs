@@ -124,6 +124,9 @@ impl Inner {
         // layer below until the page happens to paint again. WasHidden(true)
         // also stops the hidden host-frontend from keeping painting over mpv.
         self.cef_was_hidden(!visible);
+        if visible {
+            self.invalidate_view();
+        }
     }
 
     pub(crate) fn try_paste(self: &Arc<Self>) -> bool {
