@@ -334,6 +334,10 @@ const PRIMARY_WEB_VEIL_JS: &str = concat!(
     "s.textContent=",
     "'body.jmp-play-preparing{background:transparent!important;}",
     "body.jmp-play-preparing *{visibility:hidden!important;}",
+    // Jellyfin binds picture-area play/pause and double-click fullscreen to
+    // the full-page OSD element itself. Keep that hit target visible while
+    // its non-OSD children remain hidden by the blanket rule above.
+    "body.jmp-play-preparing #videoOsdPage,",
     "body.jmp-play-preparing .videoPlayerContainer,",
     "body.jmp-play-preparing .videoPlayerContainer *,",
     "body.jmp-play-preparing .videoOsdBottom,",
@@ -348,7 +352,13 @@ const PRIMARY_WEB_VEIL_JS: &str = concat!(
     "body.jmp-play-preparing .dialogContainer *,",
     "body.jmp-play-preparing .toastContainer,",
     "body.jmp-play-preparing .toastContainer *{",
-    "visibility:visible!important;}'",
+    "visibility:visible!important;}",
+    // Action sheets align their rows by rendering placeholder icons with an
+    // inline visibility:hidden. The blanket dialog rule above must not turn
+    // every placeholder (for example every subtitle checkmark) back on.
+    "body.jmp-play-preparing .dialogContainer [style*=\"visibility:hidden\"],",
+    "body.jmp-play-preparing .dialogContainer [style*=\"visibility: hidden\"]{",
+    "visibility:hidden!important;}'",
     ";",
     "document.body&&document.body.classList.add('jmp-play-preparing');",
     // Keep the page veiled until mpv-video-player mounts the poster and
@@ -659,5 +669,34 @@ mod tests {
             .unwrap_err(),
             ExtensionConfigError::SetupDocumentRequired
         );
+    }
+
+    #[test]
+    fn playback_veil_preserves_picture_pointer_target() {
+        let hidden = PRIMARY_WEB_VEIL_JS
+            .find("body.jmp-play-preparing *{visibility:hidden")
+            .unwrap();
+        let pointer_target = PRIMARY_WEB_VEIL_JS
+            .find("body.jmp-play-preparing #videoOsdPage,")
+            .unwrap();
+        let visible = PRIMARY_WEB_VEIL_JS
+            .find("visibility:visible!important;")
+            .unwrap();
+        assert!(hidden < pointer_target && pointer_target < visible);
+    }
+
+    #[test]
+    fn playback_veil_preserves_hidden_dialog_placeholders() {
+        let visible = PRIMARY_WEB_VEIL_JS
+            .find("visibility:visible!important;")
+            .unwrap();
+        let inline_hidden = PRIMARY_WEB_VEIL_JS
+            .find(".dialogContainer [style*=\"visibility:hidden\"]")
+            .unwrap();
+        let hidden = PRIMARY_WEB_VEIL_JS[inline_hidden..]
+            .find("visibility:hidden!important;")
+            .map(|offset| inline_hidden + offset)
+            .unwrap();
+        assert!(visible < inline_hidden && inline_hidden < hidden);
     }
 }
