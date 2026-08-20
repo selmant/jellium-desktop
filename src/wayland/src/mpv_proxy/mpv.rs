@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::ffi::CString;
-use std::mem::size_of;
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -264,9 +263,24 @@ fn apply_window_size_mpv(ctx: &MpvCtx, seen_gen: &mut u32) {
     }
 }
 
-/// MAXIMIZED puts mpv in `locked_size`, so mpv holds the size we hand it instead
-/// of re-deriving its geometry from the video.
-const LOCKED_STATES: [u8; size_of::<u32>()] = XdgToplevelState::MAXIMIZED.0.to_ne_bytes();
+/// MAXIMIZED keeps mpv in `locked_size` so it holds the host geometry instead
+/// of re-deriving size from the video. SUSPENDED / ACTIVATED mirror the host
+/// toplevel: without SUSPENDED, Hyprland-style compositors stop completing
+/// `wl_surface.frame` / Vulkan WSI presents for an occluded window, mpv never
+/// sets `wl->hidden` (it only uses the timeout heuristic on xdg_toplevel < 6),
+/// and video freezes while audio keeps running. ACTIVATED on resume is what
+/// makes mpv emit `VO_EVENT_EXPOSE` even when the size did not change.
+fn locked_states(suspended: bool) -> [u8; 8] {
+    let mut states = [0u8; 8];
+    states[..4].copy_from_slice(&XdgToplevelState::MAXIMIZED.0.to_ne_bytes());
+    let extra = if suspended {
+        XdgToplevelState::SUSPENDED
+    } else {
+        XdgToplevelState::ACTIVATED
+    };
+    states[4..].copy_from_slice(&extra.0.to_ne_bytes());
+    states
+}
 
 /// Emit a configure to mpv iff its toplevel exists, returning whether one was
 /// sent. A configure can only be built from an `MpvConfigurator`, so a
@@ -278,7 +292,7 @@ fn emit_mpv_configure(ctx: &MpvCtx, size: WindowSize) -> bool {
     });
     match emit {
         Some((cfg, serial)) => {
-            cfg.configure(size, serial, &LOCKED_STATES);
+            cfg.configure(size, serial, &locked_states(ctx.rt.proxy().suspended()));
             true
         }
         None => false,
@@ -470,5 +484,29 @@ impl XdgToplevelHandler for MpvToplevelH {
     }
     fn handle_unset_fullscreen(&mut self, _slf: &Rc<XdgToplevel>) {
         reassert_mpv_state(&self.ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_at(bytes: &[u8], index: usize) -> u32 {
+        let start = index * 4;
+        u32::from_ne_bytes(bytes[start..start + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn visible_configure_locks_size_and_marks_activated() {
+        let states = locked_states(false);
+        assert_eq!(state_at(&states, 0), XdgToplevelState::MAXIMIZED.0);
+        assert_eq!(state_at(&states, 1), XdgToplevelState::ACTIVATED.0);
+    }
+
+    #[test]
+    fn occluded_configure_locks_size_and_marks_suspended() {
+        let states = locked_states(true);
+        assert_eq!(state_at(&states, 0), XdgToplevelState::MAXIMIZED.0);
+        assert_eq!(state_at(&states, 1), XdgToplevelState::SUSPENDED.0);
     }
 }

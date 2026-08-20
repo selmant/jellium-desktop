@@ -1566,7 +1566,20 @@ impl WindowHandler for RootState {
         let suspended = configure.state.contains(WindowState::SUSPENDED);
         if suspended != self.suspended {
             self.suspended = suspended;
+            tracing::info!(
+                target: "Main",
+                suspended,
+                "xdg_toplevel suspended state changed"
+            );
             crate::window_state::feed_suspended(suspended);
+            self.rt.proxy().set_suspended(suspended);
+            if !suspended {
+                // mpv's video is a synchronized subsurface: Hyprland will not
+                // release in-flight Vulkan WSI images until the parent commits
+                // again after occlusion. Latch a present even when geometry is
+                // unchanged so resume is not only a CEF WasHidden flip.
+                self.rt.root().request_present();
+            }
         }
 
         // Absent the decoration protocol SCTK reports its client-side default,
