@@ -39,6 +39,8 @@ use crate::state;
 /// Returns -1 in the browser process (continue startup); returns the
 /// subprocess exit code otherwise.
 pub fn jfn_cef_start() -> c_int {
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    crate::mallinfo_shim::keep();
     // Platform hook before the FIRST CEF API call (macOS loads the CEF
     // framework here). `try_get`: Linux installs its platform after this
     // runs, and CEF helper subprocesses never install one.
