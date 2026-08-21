@@ -128,6 +128,15 @@
         }
 
         var done = false;
+        // Overlay is on document.body. Capture-phase click-outside on body
+        // would treat a pick as dismissing the surrounding dialog. Native OS
+        // <select> popups never inject that click; sink ours at document
+        // capture until after teardown so the leftover click cannot fall
+        // through onto the backdrop.
+        function onDocClick(e) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        }
         function finish(idx) {
             if (done) return;
             done = true;
@@ -137,6 +146,10 @@
             window.removeEventListener('resize', onDismiss);
             document.removeEventListener('scroll', onDismiss, true);
             host.remove();
+            // 100ms covers CEF delivering the leftover click on a later task.
+            setTimeout(function () {
+                document.removeEventListener('click', onDocClick, true);
+            }, 100);
             if (idx != null && idx !== select.selectedIndex) {
                 select.selectedIndex = idx;
                 select.dispatchEvent(new Event('input', {bubbles: true}));
@@ -145,6 +158,7 @@
         }
         open = function () { finish(null); };
         function onDismiss() { finish(null); }
+        document.addEventListener('click', onDocClick, true);
 
         function onKeyDown(e) {
             if (e.key === 'Escape') { e.preventDefault(); finish(null); }
