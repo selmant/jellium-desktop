@@ -189,6 +189,14 @@ impl RuntimeHandle {
         crate::business_extension::runtime_complete_setup_navigation(url)
     }
 
+    /// Load a trusted setup document on the existing frontend layer.
+    ///
+    /// Used when an already-running hosted UI needs to return to setup without
+    /// spawning a second process (Jellium's single-instance lock would reject it).
+    pub fn enter_setup_document(&self, url: &str) -> bool {
+        crate::business_extension::runtime_enter_setup_document(url)
+    }
+
     pub fn set_presentation(&self, presentation: Presentation) -> bool {
         crate::business_extension::runtime_set_presentation(presentation)
     }
