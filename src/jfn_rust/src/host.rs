@@ -84,4 +84,23 @@ mod tests {
         let opts = HostOptions::with_extension(ext);
         assert!(opts.extension().is_some());
     }
+
+    #[test]
+    fn cache_limit_is_preserved_with_host_extension() {
+        let desc = HostExtensionDescriptor::from_url(
+            "https://app.example/",
+            vec!["/* frontend */".into()],
+            vec![],
+            false,
+        )
+        .unwrap();
+        let ext = Arc::new(NoopExt {
+            desc,
+            ready: Mutex::new(false),
+        });
+        let opts = HostOptions::with_extension(ext).with_cef_disk_cache_limit(768 * 1024 * 1024);
+
+        assert_eq!(opts.cef_disk_cache_limit(), Some(768 * 1024 * 1024));
+        assert!(opts.extension().is_some());
+    }
 }
