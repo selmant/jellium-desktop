@@ -347,7 +347,7 @@ fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
 /// `CefInitialize` with the flags this boot resolved, recording the
 /// shared-texture decision for [`shared_textures`]. A call after a successful
 /// one returns true without re-entering CEF.
-fn ensure_cef_initialized(ba: &BootArgs) -> bool {
+fn ensure_cef_initialized(ba: &BootArgs, host_options: &crate::host::HostOptions) -> bool {
     if CEF_INITED.load(std::sync::atomic::Ordering::Acquire) {
         return true;
     }
@@ -355,6 +355,9 @@ fn ensure_cef_initialized(ba: &BootArgs) -> bool {
     SHARED_TEXTURES.store(use_shared_textures, std::sync::atomic::Ordering::Release);
     jfn_cef::ffi::jfn_cef_set_log_severity(cef_severity_for_cef_filter());
     jfn_cef::ffi::jfn_cef_set_remote_debugging_port(ba.remote_debugging_port);
+    if let Some(bytes) = host_options.cef_disk_cache_limit() {
+        jfn_cef::ffi::jfn_cef_set_disk_cache_size(bytes);
+    }
     // Shared textures are the zero-copy host presentation path. Chromium's
     // compositor is independently useful when the host falls back to GPU
     // pixel upload, especially for CSS blur and transforms. Disable it only
@@ -719,7 +722,9 @@ fn run_app(instance: &Instance, opts: StartupOptions, host_options: &crate::host
     // CEF's process bring-up needs nothing mpv owns; where the platform
     // allows it, it runs while the core thread builds the VO and its GPU
     // context instead of after.
-    if plat().cef_init_precedes_mpv_window() && !ensure_cef_initialized(&boot_args) {
+    if plat().cef_init_precedes_mpv_window()
+        && !ensure_cef_initialized(&boot_args, host_options)
+    {
         return 1;
     }
 
@@ -932,7 +937,7 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance, host_options: &crate:
     publish_device_profile(mpv_raw);
 
     // 5. CEF init flags + initialise.
-    if !ensure_cef_initialized(ba) {
+    if !ensure_cef_initialized(ba, host_options) {
         return 1;
     }
 

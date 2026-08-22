@@ -115,6 +115,16 @@ pub fn jfn_cef_set_context_initialized_callback(cb: Option<extern "C" fn()>) {
     state::with_config(|c| c.on_context_initialized = cb);
 }
 
+/// Add Chromium's generic HTTP disk-cache byte limit before CEF starts.
+pub fn jfn_cef_set_disk_cache_size(bytes: u64) {
+    state::with_config(|c| {
+        c.pending_switches.push(state::PendingSwitch::with_value(
+            "disk-cache-size",
+            &bytes.to_string(),
+        ));
+    });
+}
+
 /// Builds CefSettings and calls `CefInitialize`. Returns true on success.
 pub fn jfn_cef_initialize() -> bool {
     let cfg_severity = state::with_config(|c| c.log_severity);
