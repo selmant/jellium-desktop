@@ -1,12 +1,12 @@
 //! Process entry point. [`jfn_app_main`] owns the full main loop and
 //! returns the exit code.
 
-use std::ffi::{CStr, CString, c_char, c_int};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr;
 use std::time::Duration;
 
 use clap::Parser;
-use jfn_cef::{APP_VERSION_FULL, cef_version};
+use jfn_cef::{cef_version, APP_VERSION_FULL};
 use jfn_instance_ipc::jfn::{Request, Response};
 use jfn_instance_ipc::{Listener, Start, Stream};
 use jfn_platform_abi::{IdleInhibitLevel, Instance, LogicalSize, Platform, WindowGeometry};
@@ -398,7 +398,11 @@ fn start_playback_coordination(instance: &Instance) -> bool {
 
     jfn_playback::ingest_driver::jfn_playback_set_scale_provider(|| {
         let s = plat().get_scale();
-        if s > 0.0 { s } else { 1.0 }
+        if s > 0.0 {
+            s
+        } else {
+            1.0
+        }
     });
     jfn_playback::ingest_driver::jfn_playback_set_fullscreen_handler(|fs| {
         plat().set_fullscreen(fs)
@@ -656,7 +660,11 @@ async fn notify_running(instance: &Instance) -> c_int {
     0
 }
 
-fn run_app(instance: &Instance, opts: StartupOptions, host_options: &crate::host::HostOptions) -> c_int {
+fn run_app(
+    instance: &Instance,
+    opts: StartupOptions,
+    host_options: &crate::host::HostOptions,
+) -> c_int {
     // Boot geometry resolves before the host prepare so its display probes
     // hit the real server, not the mpv proxy the prepare may install.
     let boot = crate::window_geometry::controller().boot();
@@ -722,9 +730,7 @@ fn run_app(instance: &Instance, opts: StartupOptions, host_options: &crate::host
     // CEF's process bring-up needs nothing mpv owns; where the platform
     // allows it, it runs while the core thread builds the VO and its GPU
     // context instead of after.
-    if plat().cef_init_precedes_mpv_window()
-        && !ensure_cef_initialized(&boot_args, host_options)
-    {
+    if plat().cef_init_precedes_mpv_window() && !ensure_cef_initialized(&boot_args, host_options) {
         return 1;
     }
 
@@ -915,7 +921,11 @@ fn h_shutdown_wake_manager() {
 }
 
 /// Owns the run_with_cef body — invoked once by `jfn_app_main`.
-unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance, host_options: &crate::host::HostOptions) -> c_int {
+unsafe fn run_with_cef(
+    ba: &BootArgs,
+    instance: &Instance,
+    host_options: &crate::host::HostOptions,
+) -> c_int {
     // 2. Platform init (PlatformScope). Cleanup happens in shutdown_runtime.
     let mpv_raw = jfn_mpv::boot::jfn_mpv_handle_get();
     let platform_ok = plat().init(mpv_raw as *mut std::ffi::c_void);
