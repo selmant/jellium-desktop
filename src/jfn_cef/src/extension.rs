@@ -208,6 +208,12 @@ impl RuntimeHandle {
     pub fn request_shutdown(&self) {
         crate::business_extension::runtime_request_shutdown();
     }
+
+    /// Clear only Chromium's HTTP cache, preserving authentication/profile
+    /// state. The operation is owned by Jellium's CEF request context.
+    pub fn clear_http_cache(&self) -> bool {
+        crate::ffi::jfn_cef_clear_http_cache()
+    }
 }
 
 /// Shared extension install used by the Rust app host.

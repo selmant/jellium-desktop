@@ -125,6 +125,16 @@ pub fn jfn_cef_set_disk_cache_size(bytes: u64) {
     });
 }
 
+/// Clear Chromium's HTTP cache through the request-context API. This does not
+/// clear cookies, local storage, or other profile state.
+pub fn jfn_cef_clear_http_cache() -> bool {
+    let Some(context) = request_context_get_global_context() else {
+        return false;
+    };
+    context.clear_http_cache(None);
+    true
+}
+
 /// Builds CefSettings and calls `CefInitialize`. Returns true on success.
 pub fn jfn_cef_initialize() -> bool {
     let cfg_severity = state::with_config(|c| c.log_severity);
