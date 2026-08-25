@@ -39,6 +39,8 @@ use crate::state;
 /// Returns -1 in the browser process (continue startup); returns the
 /// subprocess exit code otherwise.
 pub fn jfn_cef_start() -> c_int {
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+    crate::mallinfo_shim::keep();
     // Platform hook before the FIRST CEF API call (macOS loads the CEF
     // framework here). `try_get`: Linux installs its platform after this
     // runs, and CEF helper subprocesses never install one.
@@ -111,6 +113,26 @@ pub fn jfn_cef_set_platform_switches(backend: DisplayBackend) {
 /// MUST be called before `jfn_cef_initialize`.
 pub fn jfn_cef_set_context_initialized_callback(cb: Option<extern "C" fn()>) {
     state::with_config(|c| c.on_context_initialized = cb);
+}
+
+/// Add Chromium's generic HTTP disk-cache byte limit before CEF starts.
+pub fn jfn_cef_set_disk_cache_size(bytes: u64) {
+    state::with_config(|c| {
+        c.pending_switches.push(state::PendingSwitch::with_value(
+            "disk-cache-size",
+            &bytes.to_string(),
+        ));
+    });
+}
+
+/// Clear Chromium's HTTP cache through the request-context API. This does not
+/// clear cookies, local storage, or other profile state.
+pub fn jfn_cef_clear_http_cache() -> bool {
+    let Some(context) = request_context_get_global_context() else {
+        return false;
+    };
+    context.clear_http_cache(None);
+    true
 }
 
 /// Builds CefSettings and calls `CefInitialize`. Returns true on success.

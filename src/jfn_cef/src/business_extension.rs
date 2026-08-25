@@ -19,8 +19,8 @@ use crate::client::{
     jfn_cef_layer_set_visible,
 };
 use crate::extension::{
-    ExtensionSource, HostExtension, MAX_EXTENSION_PAYLOAD_BYTES, Presentation, RuntimeEvent,
-    RuntimeHandle,
+    ExtensionSource, HostExtension, MAX_EXTENSION_PAYLOAD_BYTES, MAX_SETUP_DOCUMENT_BYTES,
+    Presentation, RuntimeEvent, RuntimeHandle,
 };
 use crate::ipc::{BrowserMessage, list_string};
 
@@ -475,6 +475,28 @@ fn apply_presentation_async(presentation: Presentation) {
     let _ = post_task(ThreadId::UI, Some(&mut task));
 }
 
+wrap_task! {
+    struct EnterSetupDocumentTask {
+        url: String,
+    }
+    impl Task {
+        fn execute(&self) {
+            let layer = {
+                let mut state = INSTANCE.lock();
+                let Some(state) = state.as_mut() else {
+                    return;
+                };
+                state.setup_document_url = Some(self.url.clone());
+                state.allowed_origin = "null".to_string();
+                state.setup_generation = state.setup_generation.wrapping_add(1);
+                Arc::clone(&state.frontend)
+            };
+            apply_presentation(Presentation::Frontend);
+            layer.load_url(&self.url);
+        }
+    }
+}
+
 fn show_primary_web_async() {
     jfn_extension_notify_load_starting();
     apply_presentation_async(Presentation::PrimaryWeb);
@@ -600,6 +622,28 @@ pub fn runtime_complete_setup_navigation(url: &str) -> bool {
     true
 }
 
+fn is_trusted_setup_document(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "data"
+        && url.starts_with("data:text/html;base64,")
+        && url.len() <= MAX_SETUP_DOCUMENT_BYTES
+}
+
+/// Replace the hosted frontend with a trusted setup document in-process.
+pub fn runtime_enter_setup_document(url: &str) -> bool {
+    if !is_trusted_setup_document(url) {
+        return false;
+    }
+    if INSTANCE.lock().as_ref().is_none() {
+        return false;
+    }
+    let mut task = EnterSetupDocumentTask::new(url.to_string());
+    let _ = post_task(ThreadId::UI, Some(&mut task));
+    true
+}
+
 pub fn runtime_set_presentation(presentation: Presentation) -> bool {
     // Always hop to TID_UI. Embedders may call this from playback workers;
     // mutating CEF visibility / presentation off-thread races the
@@ -655,6 +699,12 @@ mod tests {
     fn setup_authority_clears_after_navigation_helper_rejects_without_setup() {
         // Without an initialized INSTANCE, complete_setup_navigation is a no-op.
         assert!(!runtime_complete_setup_navigation("https://media.example/"));
+    }
+
+    #[test]
+    fn enter_setup_document_rejects_http_and_uninitialized_runtime() {
+        assert!(!runtime_enter_setup_document("https://media.example/"));
+        assert!(!runtime_enter_setup_document("data:text/html;base64,PGg+PC9oPg=="));
     }
 
     #[test]

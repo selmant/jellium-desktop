@@ -189,6 +189,14 @@ impl RuntimeHandle {
         crate::business_extension::runtime_complete_setup_navigation(url)
     }
 
+    /// Load a trusted setup document on the existing frontend layer.
+    ///
+    /// Used when an already-running hosted UI needs to return to setup without
+    /// spawning a second process (Jellium's single-instance lock would reject it).
+    pub fn enter_setup_document(&self, url: &str) -> bool {
+        crate::business_extension::runtime_enter_setup_document(url)
+    }
+
     pub fn set_presentation(&self, presentation: Presentation) -> bool {
         crate::business_extension::runtime_set_presentation(presentation)
     }
@@ -207,6 +215,12 @@ impl RuntimeHandle {
 
     pub fn request_shutdown(&self) {
         crate::business_extension::runtime_request_shutdown();
+    }
+
+    /// Clear only Chromium's HTTP cache, preserving authentication/profile
+    /// state. The operation is owned by Jellium's CEF request context.
+    pub fn clear_http_cache(&self) -> bool {
+        crate::ffi::jfn_cef_clear_http_cache()
     }
 }
 

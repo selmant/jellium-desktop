@@ -16,7 +16,7 @@ use std::ffi::{CStr, CString};
 use std::os::fd::IntoRawFd;
 use std::rc::Rc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::thread;
 
 use error_reporter::Report;
@@ -67,6 +67,10 @@ pub(crate) struct ProxyShared {
     // `client_id()` on client M. Same wire object => the two ids are equal.
     mpv_video_surface_id: AtomicU32,
     app_client_fd: AtomicI32,
+    /// Host `xdg_toplevel` SUSPENDED (other workspace, lock screen, …).
+    /// Forwarded to mpv so vo=gpu stops presenting instead of blocking in
+    /// Vulkan WSI waiting for frame callbacks the compositor will not send.
+    suspended: AtomicBool,
     mpv_wake: Mutex<Option<calloop::ping::Ping>>,
     proxy: OnceLock<Proxy>,
 }
@@ -77,6 +81,7 @@ impl ProxyShared {
             window: Mutex::new(None),
             mpv_video_surface_id: AtomicU32::new(0),
             app_client_fd: AtomicI32::new(-1),
+            suspended: AtomicBool::new(false),
             mpv_wake: Mutex::new(None),
             proxy: OnceLock::new(),
         }
@@ -107,6 +112,24 @@ impl ProxyShared {
             *cur = Some(PublishedSize { size, generation });
         }
         self.wake_mpv_thread();
+    }
+
+    pub(crate) fn suspended(&self) -> bool {
+        self.suspended.load(Ordering::Acquire)
+    }
+
+    /// Mirror the host toplevel's SUSPENDED flag to mpv. Bumps the published
+    /// size generation so a same-size configure still reaches mpv (needed to
+    /// flip `wl->hidden` and emit `VO_EVENT_EXPOSE` on resume).
+    pub(crate) fn set_suspended(&self, suspended: bool) {
+        if self.suspended.swap(suspended, Ordering::AcqRel) == suspended {
+            return;
+        }
+        if let Some(size) = self.window_size() {
+            self.set_window_size(size);
+        } else {
+            self.wake_mpv_thread();
+        }
     }
 
     fn wake_mpv_thread(&self) {

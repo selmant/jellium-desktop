@@ -6,14 +6,26 @@ use std::sync::Arc;
 /// Options supplied by a desktop binary hosting the Jellium runtime.
 #[derive(Clone, Default)]
 pub struct HostOptions {
+    cef_disk_cache_limit_bytes: Option<u64>,
     #[cfg(feature = "host-extension")]
     extension: Option<Arc<dyn jfn_cef::HostExtension>>,
 }
 
 impl HostOptions {
+    /// Limit Chromium's HTTP disk cache. The caller owns the policy; Jellium
+    /// only translates this generic byte budget into Chromium configuration.
+    pub fn with_cef_disk_cache_limit(mut self, bytes: u64) -> Self {
+        self.cef_disk_cache_limit_bytes = Some(bytes);
+        self
+    }
+
+    pub(crate) fn cef_disk_cache_limit(&self) -> Option<u64> {
+        self.cef_disk_cache_limit_bytes
+    }
     #[cfg(feature = "host-extension")]
     pub fn with_extension(extension: Arc<dyn jfn_cef::HostExtension>) -> Self {
         Self {
+            cef_disk_cache_limit_bytes: None,
             extension: Some(extension),
         }
     }
@@ -70,6 +82,25 @@ mod tests {
             ready: Mutex::new(false),
         });
         let opts = HostOptions::with_extension(ext);
+        assert!(opts.extension().is_some());
+    }
+
+    #[test]
+    fn cache_limit_is_preserved_with_host_extension() {
+        let desc = HostExtensionDescriptor::from_url(
+            "https://app.example/",
+            vec!["/* frontend */".into()],
+            vec![],
+            false,
+        )
+        .unwrap();
+        let ext = Arc::new(NoopExt {
+            desc,
+            ready: Mutex::new(false),
+        });
+        let opts = HostOptions::with_extension(ext).with_cef_disk_cache_limit(768 * 1024 * 1024);
+
+        assert_eq!(opts.cef_disk_cache_limit(), Some(768 * 1024 * 1024));
         assert!(opts.extension().is_some());
     }
 }

@@ -19,6 +19,8 @@ pub mod extension;
 pub mod ffi;
 pub mod injection;
 mod ipc;
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+mod mallinfo_shim;
 mod menu_ownership;
 mod paint_scheduler;
 pub mod platform_ops;
