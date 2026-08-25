@@ -337,7 +337,9 @@ pub fn jfn_browsers_send_external_begin_frame_all() {
 /// Mark every live browser visible or hidden. MUST run on TID_UI — called
 /// from the `SetHiddenAllTask` posted by `jfn_browsers_set_hidden_all`.
 /// CEF folds `WasHidden(true)` into pausing rendering / freeing GPU
-/// compositing resources and `WasHidden(false)` into a paint kick.
+/// compositing resources. `WasHidden(false)` alone is not enough after a
+/// workspace/monitor occlusion: windowless hosts can stay on a stale frame
+/// until `Invalidate` forces a paint (same path as per-layer `set_visible`).
 pub(crate) fn jfn_browsers_apply_hidden_all(hidden: bool) {
     let inners: Vec<Arc<Inner>> = {
         let g = INSTANCE.lock();
@@ -351,6 +353,9 @@ pub(crate) fn jfn_browsers_apply_hidden_all(hidden: bool) {
     };
     for i in &inners {
         i.cef_was_hidden(hidden);
+        if !hidden {
+            i.invalidate_view();
+        }
     }
 }
 

@@ -142,6 +142,13 @@ fn apply_defaults(
     // Disable mpv's clipboard so it keeps a single wl_display connection.
     if display == DisplayBackend::Wayland {
         set("clipboard-backends", "")?;
+        // Under wayland-internal-vsync=auto, compositors that advertise
+        // wp_fifo + presentation-time v2 (Hyprland among them) make mpv
+        // pick VK_PRESENT_MODE_FIFO_KHR. FIFO blocks the VO thread in
+        // drm_syncobj waits when the window is occluded — other workspace
+        // or monitor — so video freezes while audio keeps playing and
+        // quit hangs on VO teardown. `yes` forces MAILBOX instead.
+        set("wayland-internal-vsync", "yes")?;
     }
 
     // Window behavior.

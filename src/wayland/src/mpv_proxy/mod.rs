@@ -151,6 +151,43 @@ impl ProxyShared {
     }
 }
 
+#[cfg(test)]
+mod suspended_tests {
+    use super::*;
+    use crate::window_state::WindowSize;
+
+    #[test]
+    fn set_suspended_toggles_flag_and_bumps_size_generation() {
+        let shared = ProxyShared::new();
+        let size = WindowSize::new(1920, 1080).expect("size");
+        shared.set_window_size(size);
+
+        let before = shared
+            .window_size_since(0)
+            .expect("published size after set_window_size");
+        assert!(!shared.suspended());
+
+        shared.set_suspended(true);
+        assert!(shared.suspended());
+        let mid = shared
+            .window_size_since(before.generation)
+            .expect("suspend must republish size so mpv gets a configure");
+        assert_eq!(mid.size.w(), size.w());
+        assert_eq!(mid.size.h(), size.h());
+
+        // Idempotent: no generation bump when already suspended.
+        shared.set_suspended(true);
+        assert!(shared.window_size_since(mid.generation).is_none());
+
+        shared.set_suspended(false);
+        assert!(!shared.suspended());
+        assert!(
+            shared.window_size_since(mid.generation).is_some(),
+            "resume must republish so mpv clears SUSPENDED / gets ACTIVATED"
+        );
+    }
+}
+
 /// Forwarding sends can't unwind a handler; a failure desyncs a single message
 /// but is unrecoverable in place, so surface it through our infra and continue.
 fn log_send(op: &str, res: Result<(), wl_proxy::object::ObjectError>) {

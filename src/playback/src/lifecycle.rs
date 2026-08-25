@@ -53,3 +53,9 @@ pub fn jfn_lifecycle_resume() {
         f();
     }
 }
+
+/// Soft-kick mpv's VO after occlusion or output migration. Safe to call from
+/// any thread; the underlying libmpv command is async.
+pub fn jfn_playback_kick_presentation() {
+    jfn_mpv::api::jfn_mpv_kick_presentation();
+}

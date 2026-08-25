@@ -164,6 +164,10 @@ fn transition(state: LifecycleState, msg: ManagerMsg) -> LifecycleState {
         }
         (Hidden, ManagerMsg::SetVisible(true)) => {
             jfn_cef::browsers::jfn_browsers_set_hidden_all(false);
+            // Workspace/monitor occlusion can leave mpv's VO parked on a
+            // stale present; a zero relative seek re-enters the playloop
+            // without changing the user-visible position.
+            jfn_mpv::api::jfn_mpv_kick_presentation();
             Running
         }
         (Running | Hidden, ManagerMsg::Suspend) => {
@@ -174,6 +178,7 @@ fn transition(state: LifecycleState, msg: ManagerMsg) -> LifecycleState {
         }
         (Suspended, ManagerMsg::Resume) => {
             jfn_cef::browsers::jfn_browsers_set_hidden_all(false);
+            jfn_mpv::api::jfn_mpv_kick_presentation();
             Running
         }
         // No-op: already in the requested posture, or a stray event.

@@ -534,6 +534,13 @@ pub fn jfn_mpv_set_window_maximized(v: bool) {
 pub fn jfn_mpv_set_force_window_position(v: bool) {
     unsafe { set_flag(c"force-window-position", v) };
 }
+
+/// Soft-kick the VO after a compositor occlusion (workspace / monitor change).
+/// A zero relative seek forces the playloop to re-enter presentation without
+/// changing the playback position the user sees.
+pub fn jfn_mpv_kick_presentation() {
+    cmd(&[c"seek", c"0", c"relative+exact"]);
+}
 pub unsafe fn jfn_mpv_set_geometry(g: *const c_char) {
     let Some(g) = (unsafe { cstr(g) }) else {
         return;

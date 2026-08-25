@@ -602,6 +602,8 @@ impl RootState {
         } else {
             return;
         };
+        let size_changed = self.current_size.is_some_and(|prev| prev != size);
+
         // Never commit the root here: the loop's latch drain issues the one root
         // commit that presents geometry with the overlay/video subtree.
         self.window.xdg_surface().set_window_geometry(0, 0, w, h);
@@ -616,6 +618,12 @@ impl RootState {
         // themselves, so a physical size here would double-scale.
         self.rt.proxy().set_window_size(size);
         self.rt.window().publish(self.rt, size, self.mode);
+        // Monitor hops can rebuild the VO swapchain without a SUSPENDED edge;
+        // kick presentation so a wedged present wait does not survive the
+        // resize alone.
+        if size_changed {
+            jfn_playback::lifecycle::jfn_playback_kick_presentation();
+        }
 
         self.rt
             .root()
@@ -1568,8 +1576,7 @@ impl WindowHandler for RootState {
             self.suspended = suspended;
             tracing::info!(
                 target: "Main",
-                suspended,
-                "xdg_toplevel suspended state changed"
+                "xdg_toplevel suspended state changed suspended={suspended}"
             );
             crate::window_state::feed_suspended(suspended);
             self.rt.proxy().set_suspended(suspended);
@@ -1577,8 +1584,11 @@ impl WindowHandler for RootState {
                 // mpv's video is a synchronized subsurface: Hyprland will not
                 // release in-flight Vulkan WSI images until the parent commits
                 // again after occlusion. Latch a present even when geometry is
-                // unchanged so resume is not only a CEF WasHidden flip.
+                // unchanged so resume is not only a CEF WasHidden flip, and
+                // soft-kick the VO playloop in case a prior FIFO/mailbox wait
+                // left presentation stalled.
                 self.rt.root().request_present();
+                jfn_playback::lifecycle::jfn_playback_kick_presentation();
             }
         }
 
